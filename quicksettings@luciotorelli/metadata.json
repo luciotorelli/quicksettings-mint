@@ -1,0 +1,9 @@
+{
+    "uuid": "quicksettings@luciotorelli",
+    "name": "Quick Settings",
+    "description": "Access quick settings for Wi-Fi, Bluetooth, and Battery",
+    "icon": "preferences-system",
+    "max-instances": 1,
+    "cinnamon-version": ["4.8", "4.6", "4.4"]
+}
+
