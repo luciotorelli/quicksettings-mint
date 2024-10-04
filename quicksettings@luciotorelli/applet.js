@@ -1,5 +1,4 @@
 const Applet = imports.ui.applet;
-const UPower = imports.misc.interfaces.UPower;
 const Lang = imports.lang;
 const St = imports.gi.St;
 const Main = imports.ui.main;
@@ -193,7 +192,7 @@ class Monitor {
 
 /**
  * QuickSettingsApplet is a custom Cinnamon applet that provides quick access to monitor settings 
- * (brightness and contrast), Wi-Fi, Bluetooth, and battery status. It also detects connected displays.
+ * (brightness and contrast), Wi-Fi, and Bluetooth. It also detects connected displays.
  *
  * @extends Applet.IconApplet
  */
@@ -220,22 +219,18 @@ class QuickSettingsApplet extends Applet.IconApplet {
         this.menu = new Applet.AppletPopupMenu(this, orientation);
         this.menuManager.addMenu(this.menu);
 
-        this._addMenuItems(); // Add menu items such as Wi-Fi, Bluetooth, and battery status
-        this.updateStatus(); // Update the applet's status for monitors, Wi-Fi, Bluetooth, and battery
+        this._addMenuItems(); // Add menu items such as Wi-Fi and Bluetooth
+        this.updateStatus(); // Update the applet's status for monitors, Wi-Fi, and Bluetooth
     }
 
     /**
-     * Adds the basic items (Wi-Fi, Bluetooth, and battery status) to the applet's popup menu.
+     * Adds the basic items (Wi-Fi and Bluetooth) to the applet's popup menu.
      * Also initializes the detection of connected monitors.
      *
      * @private
      */
     _addMenuItems() {
         let hbox = new St.BoxLayout({ vertical: false });
-
-        // Battery status
-        this.batteryItem = new PopupMenu.PopupMenuItem(_("Battery Status"));
-        this.menu.addMenuItem(this.batteryItem);
 
         // Wi-Fi toggle switch
         this.wifiSwitch = new PopupMenu.PopupSwitchIconMenuItem(_("Wi-Fi"), false, "network-wireless-symbolic", St.IconType.SYMBOLIC);
@@ -249,9 +244,6 @@ class QuickSettingsApplet extends Applet.IconApplet {
 
         // Add the toggle switches to the menu
         this.menu.addActor(hbox);
-
-        // Add a separator between monitor settings and other items 
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         // Detect and display monitor settings
         this.updateMonitors();
@@ -298,10 +290,16 @@ class QuickSettingsApplet extends Applet.IconApplet {
      * Updates the applet's popup menu with the detected monitor brightness and contrast
      */
     updateMenu() {
-        // Clear existing brightness and contrast menu items
+        // Clear existing menu items
         this.menu.removeAll();
 
-        // Add a separator between buttons and monitor sliders 
+        // Add Wi-Fi and Bluetooth switches
+        let hbox = new St.BoxLayout({ vertical: false });
+        hbox.add_child(this.wifiSwitch.actor);
+        hbox.add_child(this.bluetoothSwitch.actor);
+        this.menu.addActor(hbox);
+
+        // Add a separator between switches and monitor sliders 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         // Add each monitor's brightness and contrast controls to the menu
@@ -309,12 +307,9 @@ class QuickSettingsApplet extends Applet.IconApplet {
             monitor.addToMenu(this.menu);
         });
 
-        // Add a separator between monitor settings and other items 
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-
         // Add a "refresh displays" button to refresh the list of monitors
         let reload = new PopupMenu.PopupImageMenuItem(
-            "Refreshing displays list...",
+            "Refresh Displays",
             "emblem-synchronizing-symbolic",
             St.IconType.SYMBOLIC,
             {
@@ -336,6 +331,9 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 ).then(() => infoOSD.destroy());
             }
         });
+
+        // Add a separator between monitor settings and other items 
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
     }
 
     /**
@@ -399,86 +397,12 @@ class QuickSettingsApplet extends Applet.IconApplet {
         }
     }
 
-/**
- * Updates the battery status by fetching details from the UPower service.
- * 
- * @async
- * @returns {Promise<void>} A promise that resolves when the battery status is updated.
- */
-async _updateBatteryStatus() {
-    let proxy = await this._getUPowerProxy();
-    let batteryPercentage = Math.round(proxy.Percentage);
-    let state = proxy.State;
-
-    let stateString;
-    switch (state) {
-        case 1:  // Charging
-            stateString = _("Charging");
-            break;
-        case 2:  // Discharging
-            stateString = _("Discharging");
-            break;
-        case 4:  // Fully Charged
-            stateString = _("Fully Charged");
-            break;
-        default:
-            stateString = _("Unknown");
-            break;
-    }
-
-    // Update battery status in the menu
-    this.batteryItem.label.text = `Battery Status: ${batteryPercentage}% (${stateString})`;
-}
-
     /**
-     * Retrieves a UPower proxy to access battery information over D-Bus.
-     * 
-     * @async
-     * @returns {Promise<object>} A promise that resolves with the UPower proxy object.
-     */
-    async _getUPowerProxy() {
-        return new Promise((resolve, reject) => {
-            Interfaces.getDBusProxyAsync(
-                "org.freedesktop.UPower",
-                "/org/freedesktop/UPower/devices/battery_BAT1",
-                Lang.bind(this, (proxy, error) => {
-                    if (error) {
-                        global.logError("Failed to get UPower proxy: " + error);
-                        reject(error);
-                    } else {
-                        resolve(proxy);
-                    }
-                })
-            );
-        });
-    }
-
-    /**
-     * Initializes the UPower proxy and sets up the listener for changes to the battery status.
-     * 
-     * @private
-     * @returns {Promise<void>} A promise that resolves when UPower is initialized.
-     */
-    _initUPower() {
-        this._getUPowerProxy().then(proxy => {
-            this._proxy = proxy;
-            this._updateBatteryStatus();  // Initial battery status update
-            this._proxy.connect("g-properties-changed", () => {
-                this._updateBatteryStatus();  // Update battery status on change
-            });
-        }).catch(e => {
-            global.logError("Failed to initialize UPower: " + e);
-        });
-    }
-
-
-    /**
-     * Updates the status of Wi-Fi, Bluetooth, battery, and monitors in the applet.
+     * Updates the status of Wi-Fi, Bluetooth, and monitors in the applet.
      */    
     updateStatus() {
         this._updateWifiSwitchState();
         this._updateBluetoothSwitchState();
-        this._initUPower();  // Initialize UPower and update battery status
         this.monitors.forEach((monitor) => {
             monitor.updateBrightness();
         });
@@ -514,35 +438,20 @@ async _updateBatteryStatus() {
             return;
         }
 
-        if (direction == Clutter.ScrollDirection.DOWN) {
-            clearTimeout(this.lastTooltipTimeoutID);
-            let tooltipMessage = this.monitors.map(monitor => {
-                monitor.brightness = Math.max(0, monitor.brightness - BRIGHTNESS_ADJUSTMENT_STEP);
-                monitor.setBrightness(monitor.brightness);
-                return `${monitor.name}: ${monitor.brightness}%`;
-            }).join("\n");
+        clearTimeout(this.lastTooltipTimeoutID);
+        let adjustment = (direction == Clutter.ScrollDirection.UP) ? BRIGHTNESS_ADJUSTMENT_STEP : -BRIGHTNESS_ADJUSTMENT_STEP;
+        let tooltipMessage = this.monitors.map(monitor => {
+            monitor.brightness = Math.min(100, Math.max(0, monitor.brightness + adjustment));
+            monitor.setBrightness(monitor.brightness);
+            return `${monitor.name}: ${monitor.brightness}%`;
+        }).join("\n");
 
-            this.set_applet_tooltip(tooltipMessage);
-            this._applet_tooltip.show();
-            this.lastTooltipTimeoutID = setTimeout(() => {
-                this._applet_tooltip.hide();
-                this.set_applet_tooltip(DEFAULT_TOOLTIP);
-            }, 2500);
-        } else if (direction == Clutter.ScrollDirection.UP) {
-            clearTimeout(this.lastTooltipTimeoutID);
-            let tooltipMessage = this.monitors.map(monitor => {
-                monitor.brightness = Math.min(100, monitor.brightness + BRIGHTNESS_ADJUSTMENT_STEP);
-                monitor.setBrightness(monitor.brightness);
-                return `${monitor.name}: ${monitor.brightness}%`;
-            }).join("\n");
-
-            this.set_applet_tooltip(tooltipMessage);
-            this._applet_tooltip.show();
-            this.lastTooltipTimeoutID = setTimeout(() => {
-                this._applet_tooltip.hide();
-                this.set_applet_tooltip(DEFAULT_TOOLTIP);
-            }, 2500);
-        }
+        this.set_applet_tooltip(tooltipMessage);
+        this._applet_tooltip.show();
+        this.lastTooltipTimeoutID = setTimeout(() => {
+            this._applet_tooltip.hide();
+            this.set_applet_tooltip(DEFAULT_TOOLTIP);
+        }, 2500);
     }
 }
 
@@ -652,5 +561,3 @@ function main(metadata, orientation, panel_height, instance_id) {
     const applet = new QuickSettingsApplet(metadata, orientation, panel_height, instance_id);
     return applet;
 }
-
-
