@@ -230,24 +230,103 @@ class QuickSettingsApplet extends Applet.IconApplet {
      * @private
      */
     _addMenuItems() {
+        // Create a horizontal box to contain the switches and icons
         let hbox = new St.BoxLayout({ vertical: false });
-
+        hbox.set_style("padding: 0px 20px;");
+        
         // Wi-Fi toggle switch
         this.wifiSwitch = new PopupMenu.PopupSwitchIconMenuItem(_("Wi-Fi"), false, "network-wireless-symbolic", St.IconType.SYMBOLIC);
         this.wifiSwitch.connect('toggled', Lang.bind(this, this._toggleWifi));
+        
+        // Add Wi-Fi switch to hbox
         hbox.add_child(this.wifiSwitch.actor);
-
+        
+        // Wi-Fi settings gear icon with St.Button and St.Icon
+        let wifiGearIcon = new St.Icon({
+            icon_name: 'applications-system-symbolic',
+            style_class: 'popup-menu-icon'
+        });
+        
+        let wifiGearButton = new St.Button({
+            child: wifiGearIcon,
+            style_class: 'popup-menu-item',
+            reactive: true,
+            can_focus: true,
+            track_hover: true
+        });
+    
+        // Add hover and focus styles
+        wifiGearButton.connect('enter-event', () => {
+            wifiGearButton.set_style('background-color: rgba(255, 255, 255, 0.1);');
+        });
+        wifiGearButton.connect('leave-event', () => {
+            wifiGearButton.set_style('background-color: transparent;');
+        });
+        wifiGearButton.connect('key-focus-in', () => {
+            wifiGearButton.set_style('background-color: rgba(255, 255, 255, 0.15);');  // Focus style
+        });
+        wifiGearButton.connect('key-focus-out', () => {
+            wifiGearButton.set_style('background-color: transparent;');  // Reset style when focus leaves
+        });
+    
+        wifiGearButton.connect('clicked', () => {
+            Util.spawnCommandLine("cinnamon-settings network");
+        });
+        
+        hbox.add_child(wifiGearButton);
+        
         // Bluetooth toggle switch
         this.bluetoothSwitch = new PopupMenu.PopupSwitchIconMenuItem(_("Bluetooth"), false, "bluetooth-symbolic", St.IconType.SYMBOLIC);
         this.bluetoothSwitch.connect('toggled', Lang.bind(this, this._toggleBluetooth));
+        
+        // Add Bluetooth switch to hbox
         hbox.add_child(this.bluetoothSwitch.actor);
+        
+        // Bluetooth settings gear icon with St.Button and St.Icon
+        let bluetoothGearIcon = new St.Icon({
+            icon_name: 'applications-system-symbolic',
+            style_class: 'popup-menu-icon'
+        });
 
-        // Add the toggle switches to the menu
+        let bluetoothGearButton = new St.Button({
+            child: bluetoothGearIcon,
+            style_class: 'popup-menu-item',
+            reactive: true,
+            can_focus: true,
+            track_hover: true
+        });
+
+        // Add hover and focus styles
+        bluetoothGearButton.connect('enter-event', () => {
+            bluetoothGearButton.set_style('background-color: rgba(255, 255, 255, 0.1);');
+        });
+        bluetoothGearButton.connect('leave-event', () => {
+            bluetoothGearButton.set_style('background-color: transparent;');
+        });
+        bluetoothGearButton.connect('key-focus-in', () => {
+            bluetoothGearButton.set_style('background-color: rgba(255, 255, 255, 0.15);');  // Focus style
+        });
+        bluetoothGearButton.connect('key-focus-out', () => {
+            bluetoothGearButton.set_style('background-color: transparent;');  // Reset style when focus leaves
+        });
+
+        // Open Linux Mint Bluetooth Manager
+        bluetoothGearButton.connect('clicked', () => {
+            Util.spawnCommandLine("blueman-manager");  // Open Bluetooth settings using Bluetooth Manager
+        });
+
+        hbox.add_child(bluetoothGearButton);
+
+        
+        // Add the hbox to the menu
+        this.menu.addMenuItem(new PopupMenu.PopupBaseMenuItem({ reactive: false }));
         this.menu.addActor(hbox);
-
+        
         // Detect and display monitor settings
         this.updateMonitors();
-    }
+    } 
+    
+        
 
     /**
      * Detects connected monitors and retrieves their brightness and contrast settings.
