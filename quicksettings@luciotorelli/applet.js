@@ -29,16 +29,11 @@ const TILE_HOVER = "rgba(255,255,255,0.13)";
 // Only used if the theme lookup below fails; matches Mint-Y-Dark-Orange.
 const ACCENT_FALLBACK = "rgb(255,113,57)";
 
-// Panel reveal. EASE_OUT_BACK overshoots a touch at the end, which is what
-// makes the reveal read as a snap; fall back if this build lacks the mode.
-const PANEL_ANIM_MS = 320;
-
-// Rough row counts, used only to reserve height the first time a panel opens
-// before its cache is warm, so the popup does not resize twice.
-const PANEL_EXPECTED_ROWS = { wifi: 6, bluetooth: 2, audio: 5, power: 3, fan: 7 };
-const PANEL_ROW_PX = 27;
-const PANEL_ANIM_MODE =
-    Clutter.AnimationMode.EASE_OUT_BACK || Clutter.AnimationMode.EASE_OUT_QUAD;
+// Panel reveal. The curve must not overshoot: it drives a height and a scale
+// that have to stay in lockstep, and EASE_OUT_BACK pushes both past their
+// target and back, which shows up as the panel springing.
+const PANEL_ANIM_MS = 260;
+const PANEL_ANIM_MODE = Clutter.AnimationMode.EASE_OUT_QUAD;
 
 // Reaction times for the strategies that share one curve, so the fan panel can
 // say what actually differs between them.
@@ -826,7 +821,22 @@ class QuickSettingsApplet extends Applet.IconApplet {
      * @private
      */
     _toggleExpansion(key) {
-        this.expandedKey = this.expandedKey === key ? null : key;
+        const opening = this.expandedKey !== key;
+        this.expandedKey = opening ? key : null;
+
+        if (opening && !this.panelCache[key]) {
+            // Cold cache: wait for the rows rather than opening an empty panel
+            // and filling it in. The prefetch on open usually means we never
+            // get here, but when we do, a short pause beats a panel that
+            // visibly assembles itself.
+            this._fetchPanel(key, (rows) => {
+                this.panelCache[key] = rows;
+                if (this.expandedKey === key) {
+                    this._syncExpansion();
+                }
+            });
+            return;
+        }
         this._syncExpansion();
     }
 
@@ -864,6 +874,9 @@ class QuickSettingsApplet extends Applet.IconApplet {
         }
         this.panelActor = this._buildExpansionPanel(this.expandedKey);
         slot.host.insert_child_at_index(this.panelActor, slot.index);
+        // Insert and animate in the same turn, so no frame is ever painted
+        // with the panel at full height.
+        this._animateIn(this.panelActor, slot.host.get_width());
     }
 
     /**
@@ -934,8 +947,12 @@ class QuickSettingsApplet extends Applet.IconApplet {
      * @param {object} panel - The panel actor.
      * @private
      */
-    _animateIn(panel) {
-        const natural = panel.get_preferred_height(-1)[1];
+    _animateIn(panel, forWidth) {
+        // Measure at the width the panel will actually be given. An unparented
+        // actor measured at -1 reported 260px for a panel that is really 626px,
+        // so the tween finished at 40% and then snapped the rest of the way -
+        // which is what made the rows look like they were loading in.
+        const natural = panel.get_preferred_height(forWidth > 0 ? forWidth : -1)[1];
         const content = panel._content;
 
         panel.opacity = 0;
@@ -1259,27 +1276,17 @@ class QuickSettingsApplet extends Applet.IconApplet {
         });
         content.add_child(link);
 
-        if (this.panelCache[key]) {
-            // Warm: render at true size straight away, no resize to come.
-            this._renderRows(list, this.panelCache[key]);
-        } else {
-            // Cold: hold roughly the right amount of room so the popup settles
-            // once rather than growing under the pointer.
-            const reserve = new St.Widget();
-            reserve.set_style(
-                "height: " + (PANEL_EXPECTED_ROWS[key] || 3) * PANEL_ROW_PX + "px;"
-            );
-            list.add_child(reserve);
-        }
+        // Rows are always already known here - _toggleExpansion will not open a
+        // panel until they are. Rendering a placeholder and swapping in the
+        // real rows a moment later is exactly what made the contents appear to
+        // load in progressively, so there is deliberately no re-fetch on open.
+        // Freshness comes from the prefetch on open and from _invalidatePanel
+        // after an action.
+        this._renderRows(list, this.panelCache[key] || []);
 
-        this._fetchPanel(key, (rows) => {
-            this.panelCache[key] = rows;
-            if (!list.is_finalized()) {
-                this._renderRows(list, rows);
-            }
-        });
-
-        this._animateIn(panel);
+        // Note: no _animateIn here. It needs the panel parented and needs to
+        // know the width it will occupy before it can measure a target height,
+        // so _syncExpansion drives it right after insertion.
         return panel;
     }
 
