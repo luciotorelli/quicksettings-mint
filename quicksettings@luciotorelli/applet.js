@@ -1,5 +1,4 @@
 const Applet = imports.ui.applet;
-const Lang = imports.lang;
 const St = imports.gi.St;
 const Main = imports.ui.main;
 const PopupMenu = imports.ui.popupMenu;
@@ -7,10 +6,48 @@ const Util = imports.misc.util;
 const ModalDialog = imports.ui.modalDialog; 
 const Clutter = imports.gi.Clutter;
 const GLib = imports.gi.GLib;
-const ByteArray = imports.byteArray;
 
 const DEFAULT_TOOLTIP = "Quick Settings";
-const BRIGHTNESS_ADJUSTMENT_STEP = 5; 
+const BRIGHTNESS_ADJUSTMENT_STEP = 5;
+
+// Tile geometry, shared by the quick toggles so they line up.
+const TILE_RADIUS = 14;
+const TILE_IDLE = "rgba(255,255,255,0.07)";
+const TILE_HOVER = "rgba(255,255,255,0.13)";
+
+// Only used if the theme lookup below fails; matches Mint-Y-Dark-Orange.
+const ACCENT_FALLBACK = "#ff7139";
+
+/**
+ * Reads the accent colour out of the active theme rather than hardcoding one.
+ *
+ * St has no CSS variables, so the way to stay native across Mint-Y-Blue,
+ * -Orange, -Teal and the rest is to ask the theme what it paints a slider
+ * with, and reuse that. Falls back to the stock orange if the lookup fails.
+ *
+ * @returns {string} A CSS colour string.
+ */
+function themeAccent() {
+    let probe = null;
+    try {
+        // A theme node only resolves once the actor is on the stage.
+        probe = new St.Widget({ style_class: "popup-slider-menu-item" });
+        global.stage.add_child(probe);
+        const [found, color] = probe
+            .get_theme_node()
+            .lookup_color("-slider-active-background-color", false);
+        if (found) {
+            return `rgb(${color.red},${color.green},${color.blue})`;
+        }
+    } catch (e) {
+        global.logError("Quick Settings: theme accent lookup failed, using fallback: " + e);
+    } finally {
+        if (probe) {
+            probe.destroy();
+        }
+    }
+    return ACCENT_FALLBACK;
+}
 
 /**
  * Monitor class represents an external display and handles brightness and contrast control.
@@ -160,7 +197,7 @@ class Monitor {
      * @returns {object} `{ actor, label, slider }` for the caller to place.
      * @private
      */
-    _buildSliderColumn(title, initial, onPreview, onCommit) {
+    _buildSliderColumn(title, initial, accent, onPreview, onCommit) {
         const column = new St.BoxLayout({ vertical: true });
         column.set_x_expand(true);
 
@@ -172,7 +209,17 @@ class Monitor {
         // The stock .popup-slider-menu-item is min-width: 15em. Two of those on
         // one line would force a ~30em popup, so halve it - the pair then fits
         // in roughly the width the single stacked slider used to take.
-        slider._slider.set_style("min-width: 7em;");
+        //
+        // The track is also a 0.3em hairline by default. Thickening it and
+        // growing the handle is what reads as "modern" without custom Cairo
+        // drawing; these are the theme's own St properties, just overridden.
+        slider._slider.set_style(
+            "min-width: 7em;" +
+            "-slider-height: 0.5em;" +
+            "-slider-handle-radius: 0.55em;" +
+            `-slider-active-background-color: ${accent};` +
+            "-slider-background-color: rgba(255,255,255,0.12);"
+        );
         // The slider is a menu item in its own right, so it arrives with the
         // popup-menu-item padding already applied. Nested inside this row that
         // padding is doubled up; drop it.
@@ -193,8 +240,9 @@ class Monitor {
      * contrast on the right - under a heading carrying the monitor's name.
      *
      * @param {object} menu - The menu to which the monitor's controls will be added.
+     * @param {string} accent - The theme accent colour for the slider fill.
      */
-    addToMenu(menu) {
+    addToMenu(menu, accent) {
         // Monitor name, on its own line above the pair.
         this.menuLabel = new PopupMenu.PopupMenuItem(this.name, {
             reactive: false,
@@ -204,6 +252,7 @@ class Monitor {
         const brightness = this._buildSliderColumn(
             "Brightness",
             this.brightness,
+            accent,
             (value) => {
                 this.brightness = value;
                 this.updateLabel(); // Live readout while the handle is moving
@@ -214,6 +263,7 @@ class Monitor {
         const contrast = this._buildSliderColumn(
             "Contrast",
             this.contrast,
+            accent,
             (value) => {
                 this.contrast = value;
                 this.updateLabel();
@@ -281,107 +331,101 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
-     * Adds the basic items (Wi-Fi and Bluetooth) to the applet's popup menu.
-     * Also initializes the detection of connected monitors.
+     * Sets up the accent, draws the shell, then goes looking for displays.
      *
      * @private
      */
     _addMenuItems() {
-        // Create a horizontal box to contain the switches and icons
-        let hbox = new St.BoxLayout({ vertical: false });
-        hbox.set_style("padding: 0px 20px;");
-        
-        // Wi-Fi toggle switch
-        this.wifiSwitch = new PopupMenu.PopupSwitchIconMenuItem(_("Wi-Fi"), false, "network-wireless-symbolic", St.IconType.SYMBOLIC);
-        this.wifiSwitch.connect('toggled', Lang.bind(this, this._toggleWifi));
-        
-        // Add Wi-Fi switch to hbox
-        hbox.add_child(this.wifiSwitch.actor);
-        
-        // Wi-Fi settings gear icon with St.Button and St.Icon
-        let wifiGearIcon = new St.Icon({
-            icon_name: 'applications-system-symbolic',
-            style_class: 'popup-menu-icon'
-        });
-        
-        let wifiGearButton = new St.Button({
-            child: wifiGearIcon,
-            style_class: 'popup-menu-item',
-            reactive: true,
-            can_focus: true,
-            track_hover: true
-        });
-    
-        // Add hover and focus styles
-        wifiGearButton.connect('enter-event', () => {
-            wifiGearButton.set_style('background-color: rgba(255, 255, 255, 0.1);');
-        });
-        wifiGearButton.connect('leave-event', () => {
-            wifiGearButton.set_style('background-color: transparent;');
-        });
-        wifiGearButton.connect('key-focus-in', () => {
-            wifiGearButton.set_style('background-color: rgba(255, 255, 255, 0.15);');  // Focus style
-        });
-        wifiGearButton.connect('key-focus-out', () => {
-            wifiGearButton.set_style('background-color: transparent;');  // Reset style when focus leaves
-        });
-    
-        wifiGearButton.connect('clicked', () => {
-            Util.spawnCommandLine("cinnamon-settings network");
-        });
-        
-        hbox.add_child(wifiGearButton);
-        
-        // Bluetooth toggle switch
-        this.bluetoothSwitch = new PopupMenu.PopupSwitchIconMenuItem(_("Bluetooth"), false, "bluetooth-symbolic", St.IconType.SYMBOLIC);
-        this.bluetoothSwitch.connect('toggled', Lang.bind(this, this._toggleBluetooth));
-        
-        // Add Bluetooth switch to hbox
-        hbox.add_child(this.bluetoothSwitch.actor);
-        
-        // Bluetooth settings gear icon with St.Button and St.Icon
-        let bluetoothGearIcon = new St.Icon({
-            icon_name: 'applications-system-symbolic',
-            style_class: 'popup-menu-icon'
-        });
-
-        let bluetoothGearButton = new St.Button({
-            child: bluetoothGearIcon,
-            style_class: 'popup-menu-item',
-            reactive: true,
-            can_focus: true,
-            track_hover: true
-        });
-
-        // Add hover and focus styles
-        bluetoothGearButton.connect('enter-event', () => {
-            bluetoothGearButton.set_style('background-color: rgba(255, 255, 255, 0.1);');
-        });
-        bluetoothGearButton.connect('leave-event', () => {
-            bluetoothGearButton.set_style('background-color: transparent;');
-        });
-        bluetoothGearButton.connect('key-focus-in', () => {
-            bluetoothGearButton.set_style('background-color: rgba(255, 255, 255, 0.15);');  // Focus style
-        });
-        bluetoothGearButton.connect('key-focus-out', () => {
-            bluetoothGearButton.set_style('background-color: transparent;');  // Reset style when focus leaves
-        });
-
-        // Open Linux Mint Bluetooth Manager
-        bluetoothGearButton.connect('clicked', () => {
-            Util.spawnCommandLine("blueman-manager");  // Open Bluetooth settings using Bluetooth Manager
-        });
-
-        hbox.add_child(bluetoothGearButton);
-
-        
-        // Add the hbox to the menu
-        this.menu.addMenuItem(new PopupMenu.PopupBaseMenuItem({ reactive: false }));
-        this.menu.addActor(hbox);
-        
-        // Detect and display monitor settings
+        this.accent = themeAccent();
+        this.updateMenu();
         this.updateMonitors();
-    } 
+    }
+
+    /**
+     * A dim uppercase caption used to group the popup into sections.
+     *
+     * @param {string} text - The heading text.
+     * @returns {object} A non-interactive menu item.
+     * @private
+     */
+    _sectionHeader(text) {
+        const item = new PopupMenu.PopupBaseMenuItem({
+            reactive: false,
+            activate: false,
+            hover: false,
+        });
+        const label = new St.Label({ text: text.toUpperCase() });
+        label.set_style(
+            "font-size: 0.72em; font-weight: bold; padding: 2px;" +
+            "color: rgba(255,255,255,0.45);"
+        );
+        item.addActor(label, { span: -1 });
+        return item;
+    }
+
+    /**
+     * Builds a Control-Centre style tile with a split click target.
+     *
+     * The body - icon and label - opens the relevant settings app. The switch
+     * on the right toggles the radio and nothing else. So hitting the toggle
+     * never navigates away, and hitting the label never flips your Wi-Fi off,
+     * which is the behaviour the gear-icon version could not express.
+     *
+     * @param {object} spec - Tile definition.
+     * @param {string} spec.icon - Symbolic icon name shown in the body.
+     * @param {string} spec.label - Caption shown beside the icon.
+     * @param {Function} spec.onOpen - Run when the body is clicked.
+     * @param {Function} spec.onToggle - Run with the new boolean state.
+     * @returns {object} `{ actor, toggle }`; toggle exposes setToggleState().
+     * @private
+     */
+    _makeToggleTile({ icon, label, onOpen, onToggle }) {
+        const tile = new St.BoxLayout({ vertical: false, reactive: true });
+        tile.set_x_expand(true);
+
+        const paint = (hovered) =>
+            tile.set_style(
+                "padding: 8px 10px; spacing: 8px; transition-duration: 150;" +
+                "border-radius: " + TILE_RADIUS + "px;" +
+                "background-color: " + (hovered ? TILE_HOVER : TILE_IDLE) + ";"
+            );
+        paint(false);
+        tile.connect("enter-event", () => paint(true));
+        tile.connect("leave-event", () => paint(false));
+
+        // Body: everything except the switch opens settings.
+        const bodyBox = new St.BoxLayout({ vertical: false, style: "spacing: 8px;" });
+        bodyBox.add_child(
+            new St.Icon({
+                icon_name: icon,
+                icon_type: St.IconType.SYMBOLIC,
+                icon_size: 18,
+            })
+        );
+        bodyBox.add_child(
+            new St.Label({ text: label, y_align: Clutter.ActorAlign.CENTER })
+        );
+
+        const body = new St.Button({ child: bodyBox, x_expand: true });
+        body.set_style("background-color: transparent; border: none; padding: 0px;");
+        body.connect("clicked", () => {
+            this.menu.close(true);
+            onOpen();
+        });
+        tile.add_child(body);
+
+        // Switch: toggles, and does not open anything.
+        const toggle = new PopupMenu.Switch(false);
+        const toggleButton = new St.Button({ child: toggle.actor });
+        toggleButton.set_style("background-color: transparent; border: none; padding: 0px;");
+        toggleButton.connect("clicked", () => {
+            toggle.toggle();
+            onToggle(toggle.state);
+        });
+        tile.add_child(toggleButton);
+
+        return { actor: tile, toggle };
+    }
     
         
 
@@ -423,28 +467,52 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
-     * Updates the applet's popup menu with the detected monitor brightness and contrast
+     * Rebuilds the popup from scratch: quick toggles, then any displays.
+     *
+     * Everything is recreated here rather than stashed and re-parented. The
+     * previous version kept the switch actors alive across removeAll() and
+     * added them to a fresh box each time, which only worked by accident -
+     * an actor that still has a parent cannot be added to another one.
      */
     updateMenu() {
-        // Clear existing menu items
         this.menu.removeAll();
 
-        // Add Wi-Fi and Bluetooth switches
-        let hbox = new St.BoxLayout({ vertical: false });
-        hbox.add_child(this.wifiSwitch.actor);
-        hbox.add_child(this.bluetoothSwitch.actor);
-        this.menu.addActor(hbox);
-
-        // Add a separator between switches and monitor sliders 
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-
-        // Add each monitor's brightness and contrast controls to the menu
-        this.monitors.forEach((monitor) => {
-            monitor.addToMenu(this.menu);
+        const wifi = this._makeToggleTile({
+            icon: "network-wireless-symbolic",
+            label: _("Wi-Fi"),
+            onOpen: () => Util.spawnCommandLine("cinnamon-settings network"),
+            onToggle: (state) => this._setWifi(state),
         });
 
-        // Add a "refresh displays" button to refresh the list of monitors
-        let reload = new PopupMenu.PopupImageMenuItem(
+        const bluetooth = this._makeToggleTile({
+            icon: "bluetooth-symbolic",
+            label: _("Bluetooth"),
+            onOpen: () => Util.spawnCommandLine("blueman-manager"),
+            onToggle: (state) => this._setBluetooth(state),
+        });
+
+        this.wifiSwitch = wifi.toggle;
+        this.bluetoothSwitch = bluetooth.toggle;
+
+        const tiles = new St.BoxLayout({ vertical: false, style: "spacing: 10px;" });
+        tiles.set_x_expand(true);
+        tiles.add_child(wifi.actor);
+        tiles.add_child(bluetooth.actor);
+
+        const tileRow = new PopupMenu.PopupBaseMenuItem({
+            reactive: false,
+            activate: false,
+            hover: false,
+        });
+        tileRow.addActor(tiles, { span: -1, expand: true });
+        this.menu.addMenuItem(tileRow);
+
+        if (this.monitors.length > 0) {
+            this.menu.addMenuItem(this._sectionHeader("Displays"));
+            this.monitors.forEach((monitor) => monitor.addToMenu(this.menu, this.accent));
+        }
+
+        const reload = new PopupMenu.PopupImageMenuItem(
             "Refresh Displays",
             "emblem-synchronizing-symbolic",
             St.IconType.SYMBOLIC,
@@ -452,53 +520,54 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 reactive: true,
             }
         );
-
         this.menu.addMenuItem(reload);
 
-        // Re-detect displays when the button is clicked
+        // Re-detect displays when the button is clicked. init=false so the menu
+        // is rebuilt once the brightness/contrast reads have landed, rather
+        // than immediately with placeholder values.
         reload.connect("activate", () => {
             if (!this.detecting) {
                 const infoOSD = new ModalDialog.InfoOSD("Detecting displays...");
                 infoOSD.show();
-                reload.destroy();
-                this.updateMonitors().then(
+                this.updateMonitors(false).then(
                     () => this.menu.open(true),
-                    e  => global.logError("Error: "  + e)
+                    (e) => global.logError("Error: " + e)
                 ).then(() => infoOSD.destroy());
             }
         });
 
-        // Add a separator between monitor settings and other items 
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        // The switches were just recreated, so push the live radio state onto them.
+        this.updateStatus();
     }
 
     /**
-     * Toggles the Wi-Fi state on or off based on the switch position.
+     * Turns Wi-Fi on or off.
      *
-     * @param {object} switchItem - The switch element that triggered the toggle.
+     * Async on purpose: spawn_command_line_sync blocks the compositor for as
+     * long as nmcli takes, which is visible as a stutter when you flip it.
+     *
+     * @param {boolean} state - Desired radio state.
      * @private
      */
-    _toggleWifi(switchItem) {
+    _setWifi(state) {
         try {
-            let command = switchItem.state ? 'nmcli radio wifi on' : 'nmcli radio wifi off';
-            // Execute Wi-Fi toggle command
-            GLib.spawn_command_line_sync(command);
+            GLib.spawn_command_line_async(state ? "nmcli radio wifi on" : "nmcli radio wifi off");
         } catch (e) {
             global.logError("Error toggling Wi-Fi in Quick Settings applet: " + e);
         }
     }
 
     /**
-     * Toggles the Bluetooth state on or off based on the switch position.
+     * Turns Bluetooth on or off. Async for the same reason as _setWifi.
      *
-     * @param {object} switchItem - The switch element that triggered the toggle.
+     * @param {boolean} state - Desired radio state.
      * @private
      */
-    _toggleBluetooth(switchItem) {
+    _setBluetooth(state) {
         try {
-            let command = switchItem.state ? 'bluetoothctl power on' : 'bluetoothctl power off';
-            // Execute Bluetooth toggle command
-            GLib.spawn_command_line_sync(command);
+            GLib.spawn_command_line_async(
+                state ? "bluetoothctl power on" : "bluetoothctl power off"
+            );
         } catch (e) {
             global.logError("Error toggling Bluetooth in Quick Settings applet: " + e);
         }
@@ -511,8 +580,13 @@ class QuickSettingsApplet extends Applet.IconApplet {
      */
     _updateWifiSwitchState() {
         try {
-            let [result, stdout, stderr] = GLib.spawn_command_line_sync('nmcli radio wifi');
-            this.wifiSwitch.setToggleState(stdout.toString().trim() === 'enabled');
+            // Async, and it hands back a string. The sync variant returned a
+            // Uint8Array whose .toString() GJS now warns about on every call.
+            Util.spawnCommandLineAsyncIO("nmcli radio wifi", (stdout) => {
+                if (this.wifiSwitch) {
+                    this.wifiSwitch.setToggleState(String(stdout).trim() === "enabled");
+                }
+            });
         } catch (e) {
             global.logError("Error updating Wi-Fi switch state in Quick Settings applet: " + e);
         }
@@ -522,12 +596,14 @@ class QuickSettingsApplet extends Applet.IconApplet {
      * Updates the Bluetooth switch to reflect the current Bluetooth state (on/off).
      *
      * @private
-     */    
+     */
     _updateBluetoothSwitchState() {
         try {
-            let [result, stdout, stderr] = GLib.spawn_command_line_sync('bluetoothctl show');
-            let output = stdout.toString();
-            this.bluetoothSwitch.setToggleState(output.includes('Powered: yes'));
+            Util.spawnCommandLineAsyncIO("bluetoothctl show", (stdout) => {
+                if (this.bluetoothSwitch) {
+                    this.bluetoothSwitch.setToggleState(String(stdout).includes("Powered: yes"));
+                }
+            });
         } catch (e) {
             global.logError("Error updating Bluetooth switch state in Quick Settings applet: " + e);
         }
