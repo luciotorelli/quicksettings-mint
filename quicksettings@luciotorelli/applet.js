@@ -26,7 +26,55 @@ const TILE_IDLE = "rgba(255,255,255,0.07)";
 const TILE_HOVER = "rgba(255,255,255,0.13)";
 
 // Only used if the theme lookup below fails; matches Mint-Y-Dark-Orange.
-const ACCENT_FALLBACK = "#ff7139";
+const ACCENT_FALLBACK = "rgb(255,113,57)";
+
+// Panel reveal. EASE_OUT_BACK overshoots a touch at the end, which is what
+// makes the reveal read as a snap; fall back if this build lacks the mode.
+const PANEL_ANIM_MS = 320;
+const PANEL_ANIM_MODE =
+    Clutter.AnimationMode.EASE_OUT_BACK || Clutter.AnimationMode.EASE_OUT_QUAD;
+
+// Reaction times for the strategies that share one curve, so the fan panel can
+// say what actually differs between them.
+const FAN_REACTION = { medium: "5s", agile: "3s", "very-agile": "2s" };
+
+/**
+ * Picks a readable foreground for a filled pill.
+ *
+ * White on Mint-Y's orange is glaring, but dark text would be unreadable on
+ * the darker accents (blue, purple), so this decides from the accent's own
+ * perceived brightness rather than assuming either.
+ *
+ * @param {string} css - An "rgb(r,g,b)" string.
+ * @returns {string} A CSS colour.
+ */
+function contrastOn(css) {
+    const parts = String(css).match(/(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+    if (!parts) {
+        return "#ffffff";
+    }
+    const r = parseInt(parts[1], 10);
+    const g = parseInt(parts[2], 10);
+    const b = parseInt(parts[3], 10);
+    // Rec. 601 luma. The 0.5 threshold puts Mint-Y's orange (0.58) on the dark
+    // side and its blue (0.47) on the light side, which is where they belong.
+    const luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+    return luma > 0.5 ? "rgba(0,0,0,0.85)" : "#ffffff";
+}
+
+/**
+ * "power-saver" -> "Power Saver".
+ *
+ * @param {string} text - Hyphenated or underscored identifier.
+ * @returns {string} Title-cased words.
+ */
+function titleCase(text) {
+    return String(text)
+        .split(/[-_]/)
+        .filter(Boolean)
+        .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+        .join(" ");
+}
 
 /**
  * Reads the accent colour out of the active theme rather than hardcoding one.
@@ -283,6 +331,9 @@ class QuickTile {
     constructor(spec, accent, handlers) {
         this.spec = spec;
         this.accent = accent;
+        // Derived once so _paint() does not recompute it on every hover.
+        this.foreground = contrastOn(accent);
+        this.darkForeground = this.foreground.indexOf("rgba(0,") === 0;
         this.active = false;
         this.hovered = false;
 
@@ -308,10 +359,14 @@ class QuickTile {
         text.add_child(this.subtitleLabel);
         inner.add_child(text);
 
-        const toggleAction = () => {
-            this.setActive(!this.active);
-            spec.onToggle(this.active);
-        };
+        // A pill without onToggle is a multi-choice one (Power Mode, Fan
+        // Curve): there is nothing binary to flip, so both halves navigate.
+        const toggleAction = spec.onToggle
+            ? () => {
+                  this.setActive(!this.active);
+                  spec.onToggle(this.active);
+              }
+            : null;
         // The chevron either expands an inline panel or launches an app.
         const chevronAction = spec.expand
             ? () => handlers.onExpand(spec.expand)
@@ -320,10 +375,12 @@ class QuickTile {
             : null;
 
         this.body = new St.Button({ child: inner, x_expand: true });
-        this.body.connect(
-            "clicked",
-            BODY_TOGGLES || !chevronAction ? toggleAction : chevronAction
-        );
+        const bodyAction =
+            (BODY_TOGGLES || !chevronAction ? toggleAction : chevronAction) ||
+            chevronAction;
+        if (bodyAction) {
+            this.body.connect("clicked", bodyAction);
+        }
         this.actor.add_child(this.body);
 
         if (chevronAction) {
@@ -336,7 +393,7 @@ class QuickTile {
             });
             this.chevron.connect(
                 "clicked",
-                BODY_TOGGLES ? chevronAction : toggleAction
+                (BODY_TOGGLES ? chevronAction : toggleAction) || chevronAction
             );
             this.actor.add_child(this.chevron);
         }
@@ -379,9 +436,12 @@ class QuickTile {
         );
 
         if (this.active) {
-            this.titleLabel.set_style("font-weight: bold; color: #ffffff;");
-            this.subtitleLabel.set_style("font-size: 0.8em; color: rgba(255,255,255,0.8);");
-            this.icon.set_style("color: #ffffff;");
+            const muted = this.darkForeground
+                ? "rgba(0,0,0,0.6)"
+                : "rgba(255,255,255,0.8)";
+            this.titleLabel.set_style("font-weight: bold; color: " + this.foreground + ";");
+            this.subtitleLabel.set_style("font-size: 0.8em; color: " + muted + ";");
+            this.icon.set_style("color: " + this.foreground + ";");
         } else {
             this.titleLabel.set_style("font-weight: bold;");
             this.subtitleLabel.set_style("font-size: 0.8em;");
@@ -394,15 +454,17 @@ class QuickTile {
             const segment = this.active
                 ? "rgba(0,0,0,0.20)"
                 : "rgba(255,255,255,0.07)";
-            const divider = this.active
-                ? "rgba(255,255,255,0.30)"
-                : "rgba(255,255,255,0.14)";
+            const divider = !this.active
+                ? "rgba(255,255,255,0.14)"
+                : this.darkForeground
+                ? "rgba(0,0,0,0.28)"
+                : "rgba(255,255,255,0.30)";
             this.chevron.set_style(
                 "padding: 9px 13px;" +
                 "background-color: " + segment + ";" +
                 "border-left: 1px solid " + divider + ";" +
                 "border-radius: 0px " + TILE_PILL_RADIUS + "px " + TILE_PILL_RADIUS + "px 0px;" +
-                (this.active ? "color: #ffffff;" : "")
+                (this.active ? "color: " + this.foreground + ";" : "")
             );
         }
     }
@@ -413,6 +475,15 @@ class QuickTile {
     setActive(state) {
         this.active = Boolean(state);
         this._paint();
+    }
+
+    /**
+     * @param {string} iconName - Replacement symbolic icon.
+     */
+    setIcon(iconName) {
+        if (iconName) {
+            this.icon.set_icon_name(iconName);
+        }
     }
 
     /**
@@ -709,6 +780,19 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 expand: "bluetooth",
                 onToggle: (state) => this._setBluetooth(state),
             },
+            // Multi-choice pills: no onToggle, so both halves open the panel.
+            {
+                key: "power",
+                icon: "power-profile-balanced-symbolic",
+                title: _("Power Mode"),
+                expand: "power",
+            },
+            {
+                key: "fan",
+                icon: "weather-windy-symbolic",
+                title: _("Fan Curve"),
+                expand: "fan",
+            },
             {
                 key: "nightlight",
                 icon: "night-light-symbolic",
@@ -716,20 +800,6 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 onToggle: (state) =>
                     setBool("org.cinnamon.settings-daemon.plugins.color", "night-light-enabled", state),
                 onOpen: "cinnamon-settings nightlight",
-            },
-            {
-                key: "dnd",
-                icon: "notifications-disabled-symbolic",
-                title: _("Do Not Disturb"),
-                // The key stores the inverse: notifications ON means DND OFF.
-                onToggle: (state) =>
-                    setBool("org.cinnamon.desktop.notifications", "display-notifications", !state),
-            },
-            {
-                key: "dark",
-                icon: "weather-clear-night-symbolic",
-                title: _("Dark Style"),
-                onToggle: (state) => this._setDarkStyle(state),
             },
             {
                 key: "airplane",
@@ -752,25 +822,42 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
-     * Fades and slides a freshly built panel into place.
+     * Animates a freshly built panel into place.
+     *
+     * Three properties together, because opacity alone was barely perceptible:
+     * it fades up, rises a clear 22px, and scales from 92% about its top edge
+     * so the growth reads as the panel pushing the rows below it apart.
+     * EASE_OUT_BACK overshoots very slightly at the end, which is what gives
+     * it a snap rather than a drift.
+     *
+     * Height is deliberately not animated: the list inside is populated
+     * asynchronously, so its natural height at this point is only that of the
+     * "Loading..." placeholder, and tweening to it would just produce a jump
+     * when the real rows arrive.
      *
      * Deferred to an idle callback because Clutter's implicit animations only
-     * run once the actor has been added to the stage and allocated; easing in
-     * the same turn as construction produces no animation at all.
+     * run once the actor is on the stage and allocated; easing in the same
+     * turn as construction animates nothing at all.
      *
      * @param {object} panel - The panel actor.
      * @private
      */
     _animateIn(panel) {
         panel.opacity = 0;
-        panel.translation_y = -12;
+        panel.translation_y = -22;
+        panel.set_pivot_point(0.5, 0);
+        panel.scale_y = 0.92;
+        panel.scale_x = 0.98;
+
         GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
             if (!panel.is_finalized()) {
                 panel.ease({
                     opacity: 255,
                     translation_y: 0,
-                    duration: 200,
-                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    scale_y: 1,
+                    scale_x: 1,
+                    duration: PANEL_ANIM_MS,
+                    mode: PANEL_ANIM_MODE,
                 });
             }
             return GLib.SOURCE_REMOVE;
@@ -887,18 +974,40 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 title: _("Wi-Fi"),
                 link: _("Wi-Fi Settings"),
                 command: "cinnamon-settings network",
+                populate: (list) => this._populateWifi(list),
             },
             bluetooth: {
                 icon: "bluetooth-symbolic",
                 title: _("Bluetooth"),
                 link: _("Bluetooth Settings"),
                 command: "blueman-manager",
+                populate: (list) => this._populateBluetooth(list),
             },
             audio: {
                 icon: "audio-volume-high-symbolic",
                 title: _("Sound"),
                 link: _("Sound Settings"),
                 command: "cinnamon-settings sound",
+                populate: (list) => this._populateAudio(list),
+            },
+            power: {
+                icon: "power-profile-balanced-symbolic",
+                title: _("Power Mode"),
+                link: _("Power Settings"),
+                command: "cinnamon-settings power",
+                populate: (list) => this._populatePower(list),
+            },
+            fan: {
+                icon: "weather-windy-symbolic",
+                title: _("Fan Curve"),
+                // No GUI exists for fw-fanctrl, so the footer runs the reset
+                // rather than launching something.
+                link: _("Reset to Default"),
+                onLink: () => {
+                    GLib.spawn_command_line_async("fw-fanctrl reset");
+                    this.updateMenu();
+                },
+                populate: (list) => this._populateFan(list),
             },
         }[key];
 
@@ -938,19 +1047,17 @@ class QuickSettingsApplet extends Applet.IconApplet {
         const link = new St.Button({ child: new St.Label({ text: meta.link }) });
         link.set_style("background-color: transparent; border: none; padding: 3px 2px;");
         link.connect("clicked", () => {
+            if (meta.onLink) {
+                meta.onLink();
+                return;
+            }
             this.menu.close(true);
             Util.spawnCommandLine(meta.command);
         });
         panel.add_child(link);
 
         list.add_child(this._panelNote(_("Loading...")));
-        if (key === "wifi") {
-            this._populateWifi(list);
-        } else if (key === "bluetooth") {
-            this._populateBluetooth(list);
-        } else {
-            this._populateAudio(list);
-        }
+        meta.populate(list);
 
         this._animateIn(panel);
         return panel;
@@ -1028,6 +1135,107 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 if (!list.get_n_children()) {
                     list.add_child(this._panelNote(_("No audio devices found")));
                 }
+            }
+        );
+    }
+
+    /**
+     * Fills the Power Mode panel from power-profiles-daemon.
+     *
+     * @param {object} list - Container to populate.
+     * @private
+     */
+    _populatePower(list) {
+        this._runAll(["powerprofilesctl list"], ([out]) => {
+            if (list.is_finalized()) {
+                return;
+            }
+            list.destroy_all_children();
+
+            // Lines look like "  balanced:" or "* power-saver:" for the active
+            // one; the indented driver lines below each are ignored.
+            const profiles = [];
+            String(out).split("\n").forEach((line) => {
+                const m = line.match(/^(\*?)\s*([a-z-]+):\s*$/);
+                if (m) {
+                    profiles.push({ name: m[2], active: m[1] === "*" });
+                }
+            });
+
+            if (!profiles.length) {
+                list.add_child(this._panelNote(_("No power profiles available")));
+                return;
+            }
+
+            profiles.forEach((profile) => {
+                list.add_child(
+                    this._panelRow(
+                        "power-profile-" + profile.name + "-symbolic",
+                        titleCase(profile.name),
+                        profile.active ? _("Active") : _("Select"),
+                        () => {
+                            if (profile.active) {
+                                return;
+                            }
+                            GLib.spawn_command_line_async(
+                                "powerprofilesctl set " + GLib.shell_quote(profile.name)
+                            );
+                            this.updateMenu();
+                        }
+                    )
+                );
+            });
+        });
+    }
+
+    /**
+     * Fills the Fan Curve panel from fw-fanctrl.
+     *
+     * @param {object} list - Container to populate.
+     * @private
+     */
+    _populateFan(list) {
+        this._runAll(
+            ["fw-fanctrl print list", "fw-fanctrl print current"],
+            ([listOut, currentOut]) => {
+                if (list.is_finalized()) {
+                    return;
+                }
+                list.destroy_all_children();
+
+                const strategies = String(listOut)
+                    .split("\n")
+                    .map((line) => line.match(/^\s*-\s*(\S+)\s*$/))
+                    .filter(Boolean)
+                    .map((m) => m[1]);
+                const current = (String(currentOut).match(/Strategy in use:\s*'([^']+)'/) || [])[1] || "";
+
+                if (!strategies.length) {
+                    list.add_child(this._panelNote(_("fw-fanctrl not responding")));
+                    return;
+                }
+
+                strategies.forEach((name) => {
+                    // medium/agile/very-agile share one curve and differ only in
+                    // how fast they react, so say which is which.
+                    const reaction = FAN_REACTION[name];
+                    list.add_child(
+                        this._panelRow(
+                            "weather-windy-symbolic",
+                            reaction ? name + "  (" + reaction + ")" : name,
+                            name === current ? _("Active") : _("Select"),
+                            () => {
+                                if (name === current) {
+                                    return;
+                                }
+                                GLib.spawn_command_line_async(
+                                    "fw-fanctrl use " + GLib.shell_quote(name)
+                                );
+                                this.updateMenu();
+                            }
+                        )
+                    );
+                });
             }
         );
     }
@@ -1344,32 +1552,6 @@ class QuickSettingsApplet extends Applet.IconApplet {
         }
     }
 
-    /**
-     * Swaps the GTK and Cinnamon themes between their light and dark variants.
-     *
-     * Mint ships these as name pairs - Mint-Y-Orange and Mint-Y-Dark-Orange -
-     * so this rewrites the name rather than hardcoding a theme. A name that
-     * does not match the pattern is left alone, which fails safe.
-     *
-     * @param {boolean} dark - True for the dark variant.
-     * @private
-     */
-    _setDarkStyle(dark) {
-        const convert = (name) =>
-            dark
-                ? name.includes("-Dark")
-                    ? name
-                    : name.replace(/^(Mint-[A-Za-z0-9]+)/, "$1-Dark")
-                : name.replace("-Dark", "");
-        try {
-            const iface = new Gio.Settings({ schema_id: "org.cinnamon.desktop.interface" });
-            iface.set_string("gtk-theme", convert(iface.get_string("gtk-theme")));
-            const theme = new Gio.Settings({ schema_id: "org.cinnamon.theme" });
-            theme.set_string("name", convert(theme.get_string("name")));
-        } catch (e) {
-            global.logError("Error switching dark style in Quick Settings applet: " + e);
-        }
-    }
 
     /**
      * Sets the default sink volume.
@@ -1531,25 +1713,36 @@ class QuickSettingsApplet extends Applet.IconApplet {
             });
         }
 
+        if (tile("power")) {
+            Util.spawnCommandLineAsyncIO("powerprofilesctl get", (out) => {
+                const name = String(out).trim();
+                if (tile("power") && name) {
+                    tile("power").setSubtitle(titleCase(name));
+                    tile("power").setIcon("power-profile-" + name + "-symbolic");
+                    // Performance is the one profile worth flagging at a glance.
+                    tile("power").setActive(name === "performance");
+                }
+            });
+        }
+
+        if (tile("fan")) {
+            this._runAll(
+                ["fw-fanctrl print current", "fw-fanctrl print speed"],
+                ([current, speed]) => {
+                    if (!tile("fan")) {
+                        return;
+                    }
+                    const strategy = (current.match(/Strategy in use:\s*'([^']+)'/) || [])[1] || "";
+                    const duty = (speed.match(/'(\d+%)'/) || [])[1] || "";
+                    tile("fan").setSubtitle([strategy, duty].filter(Boolean).join("  \u00b7  "));
+                }
+            );
+        }
+
         if (tile("nightlight")) {
             tile("nightlight").setActive(
                 getBool("org.cinnamon.settings-daemon.plugins.color", "night-light-enabled", false)
             );
-        }
-        if (tile("dnd")) {
-            tile("dnd").setActive(
-                !getBool("org.cinnamon.desktop.notifications", "display-notifications", true)
-            );
-        }
-        if (tile("dark")) {
-            try {
-                const name = new Gio.Settings({
-                    schema_id: "org.cinnamon.desktop.interface",
-                }).get_string("gtk-theme");
-                tile("dark").setActive(name.includes("-Dark"));
-            } catch (e) {
-                // leave it as-is
-            }
         }
     }
 
