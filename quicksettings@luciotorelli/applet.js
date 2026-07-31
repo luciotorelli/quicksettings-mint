@@ -914,41 +914,57 @@ class QuickSettingsApplet extends Applet.IconApplet {
     /**
      * Grows a freshly built panel open.
      *
-     * The height is what actually has to move. Fading and sliding the panel
-     * left the popup itself snapping to its new size in a single frame, which
-     * is the jump that reads as a freeze - the panel was animating but its
-     * container was not. Tweening the height makes every ancestor re-allocate
-     * each frame, so the popup grows with it.
+     * Two things move together. The shell's height is tweened 0 -> natural,
+     * which forces every ancestor to re-allocate each frame so the popup grows
+     * smoothly rather than snapping. The content inside is scaled vertically
+     * over exactly the same duration and curve.
      *
-     * Clipping is on for the duration so the rows are revealed by the growing
-     * edge rather than squashed into whatever height the tween is at.
+     * The scale is the part that matters for how it reads. Clipping a growing
+     * box on its own uncovers the rows one after another as the clip edge
+     * passes them, which looks like text being typed out. Scaling the content
+     * in step keeps its bottom edge pinned to the clip edge, so every row is
+     * present from the first frame and the whole panel unfolds as one piece.
      *
      * The target is measured before the height is pinned, because set_height()
-     * sets the natural height too - measure after and you just read back the
-     * zero. Measuring an unparented actor is slightly approximate, so the
-     * height is released to -1 on completion, which corrects any few-pixel
-     * error and lets a later refresh resize the panel normally.
+     * sets the natural height too - measure after and you read back the zero.
+     * The height is released to -1 on completion, which corrects the small
+     * error from measuring an unparented actor and lets a later cache refresh
+     * resize the panel normally.
      *
      * @param {object} panel - The panel actor.
      * @private
      */
     _animateIn(panel) {
         const natural = panel.get_preferred_height(-1)[1];
+        const content = panel._content;
 
         panel.opacity = 0;
-        if (natural > 0) {
-            panel.set_clip_to_allocation(true);
-            panel.set_height(0);
-        } else {
-            // Could not measure; fall back to the slide so something happens.
-            panel.translation_y = -18;
+        if (natural <= 0 || !content) {
+            // Could not measure; fall back to a plain fade so something happens.
+            Meta.later_add(Meta.LaterType.BEFORE_REDRAW, () => {
+                if (!panel.is_finalized()) {
+                    panel.ease({
+                        opacity: 255,
+                        duration: PANEL_ANIM_MS,
+                        mode: PANEL_ANIM_MODE,
+                    });
+                }
+                return false;
+            });
+            return;
         }
+
+        panel.set_clip_to_allocation(true);
+        panel.set_height(0);
+        content.set_pivot_point(0.5, 0);
+        content.scale_y = 0;
 
         Meta.later_add(Meta.LaterType.BEFORE_REDRAW, () => {
             if (panel.is_finalized()) {
                 return false;
             }
-            const props = {
+            panel.ease({
+                height: natural,
                 opacity: 255,
                 duration: PANEL_ANIM_MS,
                 mode: PANEL_ANIM_MODE,
@@ -959,22 +975,21 @@ class QuickSettingsApplet extends Applet.IconApplet {
                     panel.set_height(-1);
                     panel.set_clip_to_allocation(false);
                 },
-            };
-            if (natural > 0) {
-                props.height = natural;
-            } else {
-                props.translation_y = 0;
-            }
-            panel.ease(props);
+            });
+            content.ease({
+                scale_y: 1,
+                duration: PANEL_ANIM_MS,
+                mode: PANEL_ANIM_MODE,
+            });
             return false;
         });
     }
 
     /**
-     * Shrinks a panel closed, then destroys it.
+     * Folds a panel closed, then destroys it.
      *
-     * Without this the close is the same single-frame jump the open used to
-     * be, just downwards.
+     * The mirror of _animateIn, so the popup contracts the same way it grew
+     * rather than the panel simply vanishing.
      *
      * @param {object} panel - The panel actor.
      * @private
@@ -983,12 +998,20 @@ class QuickSettingsApplet extends Applet.IconApplet {
         if (!panel || panel.is_finalized()) {
             return;
         }
+        const duration = Math.round(PANEL_ANIM_MS * 0.75);
+        const content = panel._content;
+
         panel.set_clip_to_allocation(true);
         panel.set_height(panel.get_height()); // pin the current height first
+
+        if (content) {
+            content.set_pivot_point(0.5, 0);
+            content.ease({ scale_y: 0, duration: duration, mode: PANEL_ANIM_MODE });
+        }
         panel.ease({
             height: 0,
             opacity: 0,
-            duration: Math.round(PANEL_ANIM_MS * 0.75),
+            duration: duration,
             mode: PANEL_ANIM_MODE,
             onStopped: () => {
                 if (!panel.is_finalized()) {
@@ -1183,12 +1206,20 @@ class QuickSettingsApplet extends Applet.IconApplet {
             },
         }[key];
 
+        // Two layers on purpose. The outer shell is what gets clipped and
+        // height-tweened; the inner content is scaled to match, so the rows
+        // unfold together instead of being uncovered one at a time.
         const panel = new St.BoxLayout({ vertical: true });
         panel.set_x_expand(true);
         panel.set_style(
-            "padding: 12px 14px; border-radius: 18px; spacing: 6px;" +
-            "background-color: rgba(255,255,255,0.06);"
+            "border-radius: 18px; background-color: rgba(255,255,255,0.06);"
         );
+
+        const content = new St.BoxLayout({ vertical: true });
+        content.set_x_expand(true);
+        content.set_style("padding: 12px 14px; spacing: 6px;");
+        panel.add_child(content);
+        panel._content = content;
 
         const header = new St.BoxLayout({ vertical: false, style: "spacing: 12px; padding-bottom: 4px;" });
         const badge = new St.Bin({
@@ -1206,15 +1237,15 @@ class QuickSettingsApplet extends Applet.IconApplet {
         const title = new St.Label({ text: meta.title, y_align: Clutter.ActorAlign.CENTER });
         title.set_style("font-size: 1.15em; font-weight: bold;");
         header.add_child(title);
-        panel.add_child(header);
+        content.add_child(header);
 
         const list = new St.BoxLayout({ vertical: true, style: "spacing: 1px;" });
         list.set_x_expand(true);
-        panel.add_child(list);
+        content.add_child(list);
 
         const rule = new St.Widget();
         rule.set_style("height: 1px; margin: 6px 0px; background-color: rgba(255,255,255,0.12);");
-        panel.add_child(rule);
+        content.add_child(rule);
 
         const link = new St.Button({ child: new St.Label({ text: meta.link }) });
         link.set_style("background-color: transparent; border: none; padding: 3px 2px;");
@@ -1226,7 +1257,7 @@ class QuickSettingsApplet extends Applet.IconApplet {
             this.menu.close(true);
             Util.spawnCommandLine(meta.command);
         });
-        panel.add_child(link);
+        content.add_child(link);
 
         if (this.panelCache[key]) {
             // Warm: render at true size straight away, no resize to come.
