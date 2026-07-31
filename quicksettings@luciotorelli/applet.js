@@ -6,12 +6,21 @@ const Util = imports.misc.util;
 const ModalDialog = imports.ui.modalDialog; 
 const Clutter = imports.gi.Clutter;
 const GLib = imports.gi.GLib;
+const Gio = imports.gi.Gio;
 
 const DEFAULT_TOOLTIP = "Quick Settings";
 const BRIGHTNESS_ADJUSTMENT_STEP = 5;
 
+// GNOME's Quick Settings model: the tile body toggles, and the chevron on the
+// right opens the matching settings app. Note this is the INVERSE of the
+// earlier gear-icon behaviour - it is what the two-part pill shape implies,
+// and a pill with no toggle affordance anywhere would be worse. Flip this to
+// false to swap the two halves back.
+const BODY_TOGGLES = true;
+
 // Tile geometry, shared by the quick toggles so they line up.
 const TILE_RADIUS = 14;
+const TILE_PILL_RADIUS = 22;
 const TILE_IDLE = "rgba(255,255,255,0.07)";
 const TILE_HOVER = "rgba(255,255,255,0.13)";
 
@@ -296,10 +305,228 @@ class Monitor {
         this.updateLabel();
     }
 }
+/**
+ * Reads the laptop panel backlight through the Cinnamon settings daemon.
+ *
+ * Going through csd rather than /sys/class/backlight matters: the sysfs node
+ * is root-owned, and csd already holds the privileged helper. GetPercentage
+ * is a method, not a property - asking for a "Brightness" property returns
+ * InvalidArgs and reads as though the interface were missing.
+ *
+ * @param {Function} callback - Receives the percentage, or null on failure.
+ */
+function getPanelBrightness(callback) {
+    Gio.DBus.session.call(
+        "org.cinnamon.SettingsDaemon.Power",
+        "/org/cinnamon/SettingsDaemon/Power",
+        "org.cinnamon.SettingsDaemon.Power.Screen",
+        "GetPercentage",
+        null, null, Gio.DBusCallFlags.NONE, -1, null,
+        (conn, res) => {
+            try {
+                callback(conn.call_finish(res).deep_unpack()[0]);
+            } catch (e) {
+                callback(null);
+            }
+        }
+    );
+}
 
 /**
- * QuickSettingsApplet is a custom Cinnamon applet that provides quick access to monitor settings 
- * (brightness and contrast), Wi-Fi, and Bluetooth. It also detects connected displays.
+ * Sets the laptop panel backlight.
+ *
+ * @param {number} percent - 0-100.
+ */
+function setPanelBrightness(percent) {
+    Gio.DBus.session.call(
+        "org.cinnamon.SettingsDaemon.Power",
+        "/org/cinnamon/SettingsDaemon/Power",
+        "org.cinnamon.SettingsDaemon.Power.Screen",
+        "SetPercentage",
+        new GLib.Variant("(u)", [Math.max(0, Math.min(100, percent))]),
+        null, Gio.DBusCallFlags.NONE, -1, null, null
+    );
+}
+
+/**
+ * Reads a boolean GSettings key, returning a default if the schema is absent.
+ *
+ * @param {string} schema - Schema id.
+ * @param {string} key - Key name.
+ * @param {boolean} fallback - Returned if the lookup throws.
+ * @returns {boolean} The value.
+ */
+function getBool(schema, key, fallback) {
+    try {
+        return new Gio.Settings({ schema_id: schema }).get_boolean(key);
+    } catch (e) {
+        return fallback;
+    }
+}
+
+/**
+ * Writes a boolean GSettings key, ignoring a missing schema.
+ *
+ * @param {string} schema - Schema id.
+ * @param {string} key - Key name.
+ * @param {boolean} value - Value to write.
+ */
+function setBool(schema, key, value) {
+    try {
+        new Gio.Settings({ schema_id: schema }).set_boolean(key, value);
+    } catch (e) {
+        global.logError("Quick Settings: could not write " + schema + " " + key + ": " + e);
+    }
+}
+
+/**
+ * A GNOME-style quick settings pill.
+ *
+ * Two click targets in one rounded tile: the body and, where the spec supplies
+ * an onOpen, a chevron behind a hairline divider. Which half does what is
+ * decided by BODY_TOGGLES.
+ */
+class QuickTile {
+    /**
+     * @param {object} spec - Tile definition (icon, title, onToggle, onOpen).
+     * @param {string} accent - Theme accent used for the active state.
+     * @param {object} menu - Popup menu, closed before launching anything.
+     */
+    constructor(spec, accent, menu) {
+        this.spec = spec;
+        this.accent = accent;
+        this.active = false;
+        this.hovered = false;
+
+        this.actor = new St.BoxLayout({ vertical: false, reactive: true });
+        this.actor.set_x_expand(true);
+
+        const inner = new St.BoxLayout({ vertical: false, style: "spacing: 10px;" });
+        this.icon = new St.Icon({
+            icon_name: spec.icon,
+            icon_type: St.IconType.SYMBOLIC,
+            icon_size: 18,
+        });
+        inner.add_child(this.icon);
+
+        const text = new St.BoxLayout({ vertical: true });
+        this.titleLabel = new St.Label({ text: spec.title });
+        text.add_child(this.titleLabel);
+        this.subtitleLabel = new St.Label({ text: "" });
+        this.subtitleLabel.hide();
+        text.add_child(this.subtitleLabel);
+        inner.add_child(text);
+
+        const toggleAction = () => {
+            this.setActive(!this.active);
+            spec.onToggle(this.active);
+        };
+        const openAction = spec.onOpen
+            ? () => {
+                  menu.close(true);
+                  spec.onOpen();
+              }
+            : null;
+
+        this.body = new St.Button({ child: inner, x_expand: true });
+        this.body.set_style("background-color: transparent; border: none; padding: 0px;");
+        this.body.connect(
+            "clicked",
+            BODY_TOGGLES || !openAction ? toggleAction : openAction
+        );
+        this.actor.add_child(this.body);
+
+        if (openAction) {
+            this.chevron = new St.Button({
+                child: new St.Icon({
+                    icon_name: "go-next-symbolic",
+                    icon_type: St.IconType.SYMBOLIC,
+                    icon_size: 14,
+                }),
+            });
+            this.chevron.connect("clicked", BODY_TOGGLES ? openAction : toggleAction);
+            this.actor.add_child(this.chevron);
+        }
+
+        this.actor.connect("enter-event", () => {
+            this.hovered = true;
+            this._paint();
+        });
+        this.actor.connect("leave-event", () => {
+            this.hovered = false;
+            this._paint();
+        });
+
+        this._paint();
+    }
+
+    /**
+     * Repaints the tile for its current active/hover state.
+     *
+     * @private
+     */
+    _paint() {
+        const background = this.active
+            ? this.accent
+            : this.hovered
+            ? TILE_HOVER
+            : TILE_IDLE;
+
+        this.actor.set_style(
+            "padding: 10px 14px; spacing: 8px; transition-duration: 150;" +
+            "border-radius: " + TILE_PILL_RADIUS + "px;" +
+            "background-color: " + background + ";"
+        );
+
+        // Only force a colour while active. Clearing it otherwise lets the
+        // theme decide, so this still reads correctly on a light theme.
+        if (this.active) {
+            this.titleLabel.set_style("font-weight: bold; color: #ffffff;");
+            this.subtitleLabel.set_style("font-size: 0.8em; color: rgba(255,255,255,0.8);");
+            this.icon.set_style("color: #ffffff;");
+        } else {
+            this.titleLabel.set_style("font-weight: bold;");
+            this.subtitleLabel.set_style("font-size: 0.8em;");
+            this.icon.set_style(null);
+        }
+
+        if (this.chevron) {
+            this.chevron.set_style(
+                "background-color: transparent; padding: 0px 2px 0px 10px; margin-left: 6px;" +
+                "border-left: 1px solid " +
+                (this.active ? "rgba(255,255,255,0.35)" : "rgba(255,255,255,0.18)") +
+                ";"
+            );
+        }
+    }
+
+    /**
+     * @param {boolean} state - New active state.
+     */
+    setActive(state) {
+        this.active = Boolean(state);
+        this._paint();
+    }
+
+    /**
+     * @param {string} text - Secondary line; hidden when empty.
+     */
+    setSubtitle(text) {
+        if (text) {
+            this.subtitleLabel.set_text(text);
+            this.subtitleLabel.show();
+        } else {
+            this.subtitleLabel.hide();
+        }
+    }
+}
+
+/**
+ * QuickSettingsApplet - a GNOME-style control centre for Cinnamon.
+ *
+ * Layout, top to bottom: a header strip (battery plus screenshot, settings,
+ * lock and power buttons), full-width volume and panel-brightness sliders, a
+ * two-column grid of toggle pills, then the DDC/CI monitor controls.
  *
  * @extends Applet.IconApplet
  */
@@ -316,18 +543,18 @@ class QuickSettingsApplet extends Applet.IconApplet {
         super(orientation, panel_height, instance_id);
         this.detecting = false;
         this.set_applet_icon_symbolic_name("preferences-system");
-        this.set_applet_tooltip(DEFAULT_TOOLTIP); // Tooltip for the applet
-        this.actor.connect('scroll-event', (...args) => this._onScrollEvent(...args)); // Scroll event handler for brightness adjustment
+        this.set_applet_tooltip(DEFAULT_TOOLTIP);
+        this.actor.connect("scroll-event", (...args) => this._onScrollEvent(...args));
         this.lastTooltipTimeoutID = null;
         this.monitors = [];
+        this.tiles = {};
 
-        // Initialize the applet's popup menu
         this.menuManager = new PopupMenu.PopupMenuManager(this);
         this.menu = new Applet.AppletPopupMenu(this, orientation);
         this.menuManager.addMenu(this.menu);
 
-        this._addMenuItems(); // Add menu items such as Wi-Fi and Bluetooth
-        this.updateStatus(); // Update the applet's status for monitors, Wi-Fi, and Bluetooth
+        this._addMenuItems();
+        this.updateStatus();
     }
 
     /**
@@ -364,149 +591,222 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
-     * Builds a Control-Centre style tile with a split click target.
+     * A round icon button for the header strip.
      *
-     * The body - icon and label - opens the relevant settings app. The switch
-     * on the right toggles the radio and nothing else. So hitting the toggle
-     * never navigates away, and hitting the label never flips your Wi-Fi off,
-     * which is the behaviour the gear-icon version could not express.
-     *
-     * @param {object} spec - Tile definition.
-     * @param {string} spec.icon - Symbolic icon name shown in the body.
-     * @param {string} spec.label - Caption shown beside the icon.
-     * @param {Function} spec.onOpen - Run when the body is clicked.
-     * @param {Function} spec.onToggle - Run with the new boolean state.
-     * @returns {object} `{ actor, toggle }`; toggle exposes setToggleState().
+     * @param {string} iconName - Symbolic icon name.
+     * @param {string} command - Command line to run.
+     * @returns {object} The button actor.
      * @private
      */
-    _makeToggleTile({ icon, label, onOpen, onToggle }) {
-        const tile = new St.BoxLayout({ vertical: false, reactive: true });
-        tile.set_x_expand(true);
-
+    _circleButton(iconName, command) {
+        const button = new St.Button({
+            child: new St.Icon({
+                icon_name: iconName,
+                icon_type: St.IconType.SYMBOLIC,
+                icon_size: 16,
+            }),
+        });
         const paint = (hovered) =>
-            tile.set_style(
-                "padding: 8px 10px; spacing: 8px; transition-duration: 150;" +
-                "border-radius: " + TILE_RADIUS + "px;" +
+            button.set_style(
+                "width: 32px; height: 32px; border-radius: 16px;" +
+                "transition-duration: 150;" +
                 "background-color: " + (hovered ? TILE_HOVER : TILE_IDLE) + ";"
             );
         paint(false);
-        tile.connect("enter-event", () => paint(true));
-        tile.connect("leave-event", () => paint(false));
+        button.connect("enter-event", () => paint(true));
+        button.connect("leave-event", () => paint(false));
+        button.connect("clicked", () => {
+            this.menu.close(true);
+            Util.spawnCommandLine(command);
+        });
+        return button;
+    }
 
-        // Body: everything except the switch opens settings.
-        const bodyBox = new St.BoxLayout({ vertical: false, style: "spacing: 8px;" });
-        bodyBox.add_child(
+    /**
+     * Header strip: battery readout on the left, system actions on the right.
+     *
+     * @returns {object} The row actor.
+     * @private
+     */
+    _buildHeader() {
+        const row = new St.BoxLayout({ vertical: false, style: "spacing: 6px;" });
+        row.set_x_expand(true);
+
+        const battery = new St.BoxLayout({ vertical: false });
+        battery.set_style(
+            "spacing: 6px; padding: 6px 14px; border-radius: 16px;" +
+            "background-color: " + TILE_IDLE + ";"
+        );
+        this.batteryIcon = new St.Icon({
+            icon_name: "battery-good-symbolic",
+            icon_type: St.IconType.SYMBOLIC,
+            icon_size: 16,
+        });
+        battery.add_child(this.batteryIcon);
+        this.batteryLabel = new St.Label({
+            text: "--%",
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        battery.add_child(this.batteryLabel);
+        row.add_child(battery);
+
+        const spacer = new St.Widget();
+        spacer.set_x_expand(true);
+        row.add_child(spacer);
+
+        row.add_child(this._circleButton("applets-screenshooter-symbolic", "gnome-screenshot -i"));
+        row.add_child(this._circleButton("emblem-system-symbolic", "cinnamon-settings"));
+        row.add_child(this._circleButton("changes-prevent-symbolic", "cinnamon-screensaver-command --lock"));
+        row.add_child(this._circleButton("system-shutdown-symbolic", "cinnamon-session-quit --power-off"));
+
+        return row;
+    }
+
+    /**
+     * One full-width slider with a leading icon.
+     *
+     * @param {string} iconName - Symbolic icon name.
+     * @param {Function} onCommit - Called with 0-100 on drag-end.
+     * @returns {object} `{ actor, slider }`.
+     * @private
+     */
+    _sliderRow(iconName, onCommit) {
+        const row = new St.BoxLayout({ vertical: false, style: "spacing: 12px; padding: 2px 6px;" });
+        row.set_x_expand(true);
+        row.add_child(
             new St.Icon({
-                icon_name: icon,
+                icon_name: iconName,
                 icon_type: St.IconType.SYMBOLIC,
                 icon_size: 18,
             })
         );
-        bodyBox.add_child(
-            new St.Label({ text: label, y_align: Clutter.ActorAlign.CENTER })
+
+        const slider = new PopupMenu.PopupSliderMenuItem(0);
+        slider._slider.set_style(
+            "min-width: 16em;" +
+            "-slider-height: 0.5em;" +
+            "-slider-handle-radius: 0.55em;" +
+            "-slider-active-background-color: " + this.accent + ";" +
+            "-slider-background-color: rgba(255,255,255,0.12);"
         );
+        slider.actor.set_style("padding: 0px;");
+        slider.actor.set_x_expand(true);
+        // Commit on drag-end only. Firing on value-changed would spawn a
+        // process per motion event.
+        slider.connect("drag-end", (s) => onCommit(Math.round(100 * s.value)));
+        row.add_child(slider.actor);
 
-        const body = new St.Button({ child: bodyBox, x_expand: true });
-        body.set_style("background-color: transparent; border: none; padding: 0px;");
-        body.connect("clicked", () => {
-            this.menu.close(true);
-            onOpen();
-        });
-        tile.add_child(body);
-
-        // Switch: toggles, and does not open anything.
-        const toggle = new PopupMenu.Switch(false);
-        const toggleButton = new St.Button({ child: toggle.actor });
-        toggleButton.set_style("background-color: transparent; border: none; padding: 0px;");
-        toggleButton.connect("clicked", () => {
-            toggle.toggle();
-            onToggle(toggle.state);
-        });
-        tile.add_child(toggleButton);
-
-        return { actor: tile, toggle };
+        return { actor: row, slider };
     }
-    
-        
 
     /**
-     * Detects connected monitors and retrieves their brightness and contrast settings.
+     * The toggle pills, in the order they appear in the grid.
      *
-     * @param {boolean} [init=true] - Whether the detection is happening on initialization.
-     * @returns {Promise<void>} A promise that resolves when the monitors have been detected and their settings fetched.
+     * @returns {Array<object>} Tile specs.
+     * @private
      */
-    async updateMonitors(init = true) {
-        this.detecting = true;
-        global.log("Detecting displays...");
-        this.monitors = (await getDisplays()).map(
-            // Create a Monitor object for each display detected
-            (d) => new Monitor(d.index, d.name, d.bus)
-        );
-
-        if (this.monitors.length === 0) {
-            global.log("Could not find any ddc/ci displays.", "warning");
-        }
-
-        if (init) {
-            // Update the applet menu after initial detection
-            this.updateMenu();
-        }
-
-        // Get brightness and contrast for each monitor
-        for (const monitor of this.monitors) {
-            global.log(`Getting brightness of display ${monitor.index}...`);
-            await monitor.updateBrightness();
-            await monitor.updateContrast();
-        }
-
-        this.detecting = false;
-        if (!init) {
-            // Update menu after detection is complete
-            this.updateMenu();
-        }
+    _tileSpecs() {
+        return [
+            {
+                key: "wifi",
+                icon: "network-wireless-symbolic",
+                title: _("Wi-Fi"),
+                onToggle: (state) => this._setWifi(state),
+                onOpen: () => Util.spawnCommandLine("cinnamon-settings network"),
+            },
+            {
+                key: "bluetooth",
+                icon: "bluetooth-symbolic",
+                title: _("Bluetooth"),
+                onToggle: (state) => this._setBluetooth(state),
+                onOpen: () => Util.spawnCommandLine("blueman-manager"),
+            },
+            {
+                key: "nightlight",
+                icon: "night-light-symbolic",
+                title: _("Night Light"),
+                onToggle: (state) =>
+                    setBool("org.cinnamon.settings-daemon.plugins.color", "night-light-enabled", state),
+                onOpen: () => Util.spawnCommandLine("cinnamon-settings nightlight"),
+            },
+            {
+                key: "dnd",
+                icon: "notifications-disabled-symbolic",
+                title: _("Do Not Disturb"),
+                // The key stores the inverse: notifications ON means DND OFF.
+                onToggle: (state) =>
+                    setBool("org.cinnamon.desktop.notifications", "display-notifications", !state),
+            },
+            {
+                key: "dark",
+                icon: "weather-clear-night-symbolic",
+                title: _("Dark Style"),
+                onToggle: (state) => this._setDarkStyle(state),
+            },
+            {
+                key: "airplane",
+                icon: "airplane-mode-symbolic",
+                title: _("Airplane Mode"),
+                onToggle: (state) => this._setAirplane(state),
+            },
+        ];
     }
 
     /**
-     * Rebuilds the popup from scratch: quick toggles, then any displays.
+     * Lays the tile specs out two to a row.
      *
-     * Everything is recreated here rather than stashed and re-parented. The
-     * previous version kept the switch actors alive across removeAll() and
-     * added them to a fresh box each time, which only worked by accident -
-     * an actor that still has a parent cannot be added to another one.
+     * @returns {object} The grid actor.
+     * @private
+     */
+    _buildTileGrid() {
+        const specs = this._tileSpecs();
+        const grid = new St.BoxLayout({ vertical: true, style: "spacing: 8px;" });
+        grid.set_x_expand(true);
+
+        for (let i = 0; i < specs.length; i += 2) {
+            const row = new St.BoxLayout({ vertical: false, style: "spacing: 8px;" });
+            row.set_x_expand(true);
+            specs.slice(i, i + 2).forEach((spec) => {
+                const tile = new QuickTile(spec, this.accent, this.menu);
+                this.tiles[spec.key] = tile;
+                row.add_child(tile.actor);
+            });
+            grid.add_child(row);
+        }
+        return grid;
+    }
+
+    /**
+     * Rebuilds the whole popup from scratch.
      */
     updateMenu() {
         this.menu.removeAll();
+        this.tiles = {};
 
-        const wifi = this._makeToggleTile({
-            icon: "network-wireless-symbolic",
-            label: _("Wi-Fi"),
-            onOpen: () => Util.spawnCommandLine("cinnamon-settings network"),
-            onToggle: (state) => this._setWifi(state),
-        });
+        const root = new St.BoxLayout({ vertical: true, style: "spacing: 12px; padding: 6px 8px;" });
+        root.set_x_expand(true);
 
-        const bluetooth = this._makeToggleTile({
-            icon: "bluetooth-symbolic",
-            label: _("Bluetooth"),
-            onOpen: () => Util.spawnCommandLine("blueman-manager"),
-            onToggle: (state) => this._setBluetooth(state),
-        });
+        root.add_child(this._buildHeader());
 
-        this.wifiSwitch = wifi.toggle;
-        this.bluetoothSwitch = bluetooth.toggle;
+        const sliders = new St.BoxLayout({ vertical: true, style: "spacing: 8px;" });
+        sliders.set_x_expand(true);
+        this.volumeRow = this._sliderRow("audio-volume-high-symbolic", (v) => this._setVolume(v));
+        this.panelRow = this._sliderRow("display-brightness-symbolic", (v) => setPanelBrightness(v));
+        sliders.add_child(this.volumeRow.actor);
+        sliders.add_child(this.panelRow.actor);
+        root.add_child(sliders);
 
-        const tiles = new St.BoxLayout({ vertical: false, style: "spacing: 10px;" });
-        tiles.set_x_expand(true);
-        tiles.add_child(wifi.actor);
-        tiles.add_child(bluetooth.actor);
+        root.add_child(this._buildTileGrid());
 
-        const tileRow = new PopupMenu.PopupBaseMenuItem({
+        const shell = new PopupMenu.PopupBaseMenuItem({
             reactive: false,
             activate: false,
             hover: false,
         });
-        tileRow.addActor(tiles, { span: -1, expand: true });
-        this.menu.addMenuItem(tileRow);
+        shell.addActor(root, { span: -1, expand: true });
+        this.menu.addMenuItem(shell);
 
+        // DDC/CI monitors keep their own section below the grid.
         if (this.monitors.length > 0) {
             this.menu.addMenuItem(this._sectionHeader("Displays"));
             this.monitors.forEach((monitor) => monitor.addToMenu(this.menu, this.accent));
@@ -521,10 +821,6 @@ class QuickSettingsApplet extends Applet.IconApplet {
             }
         );
         this.menu.addMenuItem(reload);
-
-        // Re-detect displays when the button is clicked. init=false so the menu
-        // is rebuilt once the brightness/contrast reads have landed, rather
-        // than immediately with placeholder values.
         reload.connect("activate", () => {
             if (!this.detecting) {
                 const infoOSD = new ModalDialog.InfoOSD("Detecting displays...");
@@ -536,8 +832,40 @@ class QuickSettingsApplet extends Applet.IconApplet {
             }
         });
 
-        // The switches were just recreated, so push the live radio state onto them.
         this.updateStatus();
+    }
+
+    /**
+     * Detects connected monitors and retrieves their brightness and contrast settings.
+     *
+     * @param {boolean} [init=true] - Whether the detection is happening on initialization.
+     * @returns {Promise<void>} Resolves once the monitors have been read.
+     */
+    async updateMonitors(init = true) {
+        this.detecting = true;
+        global.log("Detecting displays...");
+        this.monitors = (await getDisplays()).map(
+            (d) => new Monitor(d.index, d.name, d.bus)
+        );
+
+        if (this.monitors.length === 0) {
+            global.log("Could not find any ddc/ci displays.", "warning");
+        }
+
+        if (init) {
+            this.updateMenu();
+        }
+
+        for (const monitor of this.monitors) {
+            global.log("Getting brightness of display " + monitor.index + "...");
+            await monitor.updateBrightness();
+            await monitor.updateContrast();
+        }
+
+        this.detecting = false;
+        if (!init) {
+            this.updateMenu();
+        }
     }
 
     /**
@@ -574,55 +902,227 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
-     * Updates the Wi-Fi switch to reflect the current Wi-Fi state (on/off).
+     * Airplane mode: every radio nmcli knows about.
      *
+     * @param {boolean} state - True to switch the radios off.
      * @private
      */
-    _updateWifiSwitchState() {
+    _setAirplane(state) {
         try {
-            // Async, and it hands back a string. The sync variant returned a
-            // Uint8Array whose .toString() GJS now warns about on every call.
-            Util.spawnCommandLineAsyncIO("nmcli radio wifi", (stdout) => {
-                if (this.wifiSwitch) {
-                    this.wifiSwitch.setToggleState(String(stdout).trim() === "enabled");
-                }
-            });
+            GLib.spawn_command_line_async(state ? "nmcli radio all off" : "nmcli radio all on");
         } catch (e) {
-            global.logError("Error updating Wi-Fi switch state in Quick Settings applet: " + e);
+            global.logError("Error toggling airplane mode in Quick Settings applet: " + e);
         }
     }
 
     /**
-     * Updates the Bluetooth switch to reflect the current Bluetooth state (on/off).
+     * Swaps the GTK and Cinnamon themes between their light and dark variants.
      *
+     * Mint ships these as name pairs - Mint-Y-Orange and Mint-Y-Dark-Orange -
+     * so this rewrites the name rather than hardcoding a theme. A name that
+     * does not match the pattern is left alone, which fails safe.
+     *
+     * @param {boolean} dark - True for the dark variant.
      * @private
      */
-    _updateBluetoothSwitchState() {
+    _setDarkStyle(dark) {
+        const convert = (name) =>
+            dark
+                ? name.includes("-Dark")
+                    ? name
+                    : name.replace(/^(Mint-[A-Za-z0-9]+)/, "$1-Dark")
+                : name.replace("-Dark", "");
         try {
-            Util.spawnCommandLineAsyncIO("bluetoothctl show", (stdout) => {
-                if (this.bluetoothSwitch) {
-                    this.bluetoothSwitch.setToggleState(String(stdout).includes("Powered: yes"));
-                }
-            });
+            const iface = new Gio.Settings({ schema_id: "org.cinnamon.desktop.interface" });
+            iface.set_string("gtk-theme", convert(iface.get_string("gtk-theme")));
+            const theme = new Gio.Settings({ schema_id: "org.cinnamon.theme" });
+            theme.set_string("name", convert(theme.get_string("name")));
         } catch (e) {
-            global.logError("Error updating Bluetooth switch state in Quick Settings applet: " + e);
+            global.logError("Error switching dark style in Quick Settings applet: " + e);
         }
     }
 
     /**
-     * Updates the status of Wi-Fi, Bluetooth, and monitors in the applet.
-     */    
+     * Sets the default sink volume.
+     *
+     * pactl rather than Cvc: this only needs a fire-and-forget write on
+     * drag-end, and Cvc would mean carrying a live MixerControl and its
+     * state-changed handshake for no gain here.
+     *
+     * @param {number} percent - 0-100.
+     * @private
+     */
+    _setVolume(percent) {
+        try {
+            GLib.spawn_command_line_async(
+                "pactl set-sink-volume @DEFAULT_SINK@ " + Math.max(0, Math.min(100, percent)) + "%"
+            );
+        } catch (e) {
+            global.logError("Error setting volume in Quick Settings applet: " + e);
+        }
+    }
+
+    /**
+     * Refreshes every readout in the popup from the live system state.
+     */
     updateStatus() {
-        this._updateWifiSwitchState();
-        this._updateBluetoothSwitchState();
-        this.monitors.forEach((monitor) => {
-            monitor.updateBrightness();
+        this._refreshBattery();
+        this._refreshVolume();
+        this._refreshPanelBrightness();
+        this._refreshTiles();
+        this.monitors.forEach((monitor) => monitor.updateBrightness());
+    }
+
+    /**
+     * @private
+     */
+    _refreshBattery() {
+        if (!this.batteryLabel) {
+            return;
+        }
+        try {
+            const name = this._findBattery();
+            if (!name) {
+                this.batteryLabel.set_text("--%");
+                return;
+            }
+            const base = "/sys/class/power_supply/" + name + "/";
+            const read = (file) => {
+                const [ok, contents] = GLib.file_get_contents(base + file);
+                return ok ? String(contents).trim() : "";
+            };
+            this.batteryLabel.set_text(read("capacity") + "%");
+            if (this.batteryIcon) {
+                this.batteryIcon.set_icon_name(
+                    read("status") === "Charging"
+                        ? "battery-good-charging-symbolic"
+                        : "battery-good-symbolic"
+                );
+            }
+        } catch (e) {
+            this.batteryLabel.set_text("--%");
+        }
+    }
+
+    /**
+     * Finds the internal battery under /sys/class/power_supply.
+     *
+     * Not hardcoded to BAT0: this machine's pack is BAT1, and the directory
+     * also carries hidpp_battery_0 for a paired Logitech device, which reports
+     * its own charge and would otherwise be shown as the laptop's.
+     *
+     * @returns {string|null} Device directory name, or null if none.
+     * @private
+     */
+    _findBattery() {
+        try {
+            const iter = Gio.File.new_for_path("/sys/class/power_supply")
+                .enumerate_children("standard::name", Gio.FileQueryInfoFlags.NONE, null);
+            let info;
+            while ((info = iter.next_file(null)) !== null) {
+                if (/^BAT/i.test(info.get_name())) {
+                    return info.get_name();
+                }
+            }
+        } catch (e) {
+            global.logError("Quick Settings: battery lookup failed: " + e);
+        }
+        return null;
+    }
+
+    /**
+     * @private
+     */
+    _refreshVolume() {
+        if (!this.volumeRow) {
+            return;
+        }
+        Util.spawnCommandLineAsyncIO(
+            "pactl get-sink-volume @DEFAULT_SINK@",
+            (stdout) => {
+                const match = String(stdout).match(/(\d+)%/);
+                if (match && this.volumeRow) {
+                    this.volumeRow.slider.setValue(Math.min(100, parseInt(match[1], 10)) / 100);
+                }
+            }
+        );
+    }
+
+    /**
+     * @private
+     */
+    _refreshPanelBrightness() {
+        getPanelBrightness((percent) => {
+            if (percent !== null && this.panelRow) {
+                this.panelRow.slider.setValue(percent / 100);
+            }
         });
     }
 
     /**
+     * Pushes live state onto every tile.
+     *
+     * @private
+     */
+    _refreshTiles() {
+        const tile = (key) => this.tiles[key];
+
+        if (tile("wifi")) {
+            Util.spawnCommandLineAsyncIO("nmcli radio wifi", (stdout) => {
+                const on = String(stdout).trim() === "enabled";
+                if (tile("wifi")) {
+                    tile("wifi").setActive(on);
+                }
+                if (tile("airplane")) {
+                    tile("airplane").setActive(!on);
+                }
+            });
+            Util.spawnCommandLineAsyncIO(
+                "nmcli -t -f active,ssid dev wifi",
+                (stdout) => {
+                    const line = String(stdout)
+                        .split("\n")
+                        .find((l) => l.startsWith("yes:"));
+                    if (tile("wifi")) {
+                        tile("wifi").setSubtitle(line ? line.slice(4) : "");
+                    }
+                }
+            );
+        }
+
+        if (tile("bluetooth")) {
+            Util.spawnCommandLineAsyncIO("bluetoothctl show", (stdout) => {
+                if (tile("bluetooth")) {
+                    tile("bluetooth").setActive(String(stdout).includes("Powered: yes"));
+                }
+            });
+        }
+
+        if (tile("nightlight")) {
+            tile("nightlight").setActive(
+                getBool("org.cinnamon.settings-daemon.plugins.color", "night-light-enabled", false)
+            );
+        }
+        if (tile("dnd")) {
+            tile("dnd").setActive(
+                !getBool("org.cinnamon.desktop.notifications", "display-notifications", true)
+            );
+        }
+        if (tile("dark")) {
+            try {
+                const name = new Gio.Settings({
+                    schema_id: "org.cinnamon.desktop.interface",
+                }).get_string("gtk-theme");
+                tile("dark").setActive(name.includes("-Dark"));
+            } catch (e) {
+                // leave it as-is
+            }
+        }
+    }
+
+    /**
      * Handles the applet click event, updating the status and toggling the menu visibility.
-     */    
+     */
     on_applet_clicked() {
         this.updateStatus();
         this.menu.toggle();
@@ -630,9 +1130,9 @@ class QuickSettingsApplet extends Applet.IconApplet {
 
     /**
      * Handles the applet being added to the panel, initializing monitor detection.
-     */    
+     */
     on_applet_added_to_panel() {
-        if(!this.detecting) {
+        if (!this.detecting) {
             this.updateMonitors();
         }
     }
@@ -643,7 +1143,7 @@ class QuickSettingsApplet extends Applet.IconApplet {
      * @param {object} actor - The actor receiving the scroll event.
      * @param {object} event - The scroll event object.
      * @private
-     */    
+     */
     _onScrollEvent(actor, event) {
         let direction = event.get_scroll_direction();
         if (direction == Clutter.ScrollDirection.SMOOTH) {
