@@ -553,14 +553,66 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
-     * One full-width slider with a leading icon.
+     * A slider styled to match the rest of the popup.
+     *
+     * @param {string} minWidth - CSS min-width for the track.
+     * @returns {object} The PopupSliderMenuItem.
+     * @private
+     */
+    _makeSlider(minWidth) {
+        const slider = new PopupMenu.PopupSliderMenuItem(0);
+        slider._slider.set_style(
+            "min-width: " + minWidth + ";" +
+            "-slider-height: 0.5em;" +
+            "-slider-handle-radius: 0.55em;" +
+            "-slider-active-background-color: " + this.accent + ";" +
+            "-slider-background-color: rgba(255,255,255,0.12);"
+        );
+        slider.actor.set_style("padding: 0px;");
+        slider.actor.set_x_expand(true);
+        return slider;
+    }
+
+    /**
+     * A small borderless icon button with a hover wash.
+     *
+     * @param {string} iconName - Symbolic icon name.
+     * @param {number} size - Icon size.
+     * @param {Function} onClick - Click handler.
+     * @returns {object} The button actor.
+     * @private
+     */
+    _iconButton(iconName, size, onClick) {
+        const button = new St.Button({
+            child: new St.Icon({
+                icon_name: iconName,
+                icon_type: St.IconType.SYMBOLIC,
+                icon_size: size,
+            }),
+        });
+        const paint = (hovered) =>
+            button.set_style(
+                "padding: 5px; border-radius: 12px; transition-duration: 150;" +
+                "background-color: " + (hovered ? TILE_HOVER : "transparent") + ";"
+            );
+        paint(false);
+        button.connect("enter-event", () => paint(true));
+        button.connect("leave-event", () => paint(false));
+        button.connect("clicked", onClick);
+        return button;
+    }
+
+    /**
+     * One full-width slider with a leading icon, and optionally a trailing
+     * chevron that opens a panel.
      *
      * @param {string} iconName - Symbolic icon name.
      * @param {Function} onCommit - Called with 0-100 on drag-end.
+     * @param {string} [expandKey] - Panel to open from the chevron.
      * @returns {object} `{ actor, slider }`.
      * @private
      */
-    _sliderRow(iconName, onCommit) {
+    _sliderRow(iconName, onCommit, expandKey) {
         const row = new St.BoxLayout({ vertical: false, style: "spacing: 12px; padding: 2px 6px;" });
         row.set_x_expand(true);
         row.add_child(
@@ -571,22 +623,66 @@ class QuickSettingsApplet extends Applet.IconApplet {
             })
         );
 
-        const slider = new PopupMenu.PopupSliderMenuItem(0);
-        slider._slider.set_style(
-            "min-width: 16em;" +
-            "-slider-height: 0.5em;" +
-            "-slider-handle-radius: 0.55em;" +
-            "-slider-active-background-color: " + this.accent + ";" +
-            "-slider-background-color: rgba(255,255,255,0.12);"
-        );
-        slider.actor.set_style("padding: 0px;");
-        slider.actor.set_x_expand(true);
+        const slider = this._makeSlider("14em");
         // Commit on drag-end only. Firing on value-changed would spawn a
         // process per motion event.
         slider.connect("drag-end", (s) => onCommit(Math.round(100 * s.value)));
         row.add_child(slider.actor);
 
+        if (expandKey) {
+            row.add_child(
+                this._iconButton("go-next-symbolic", 14, () => this._toggleExpansion(expandKey))
+            );
+        }
+
         return { actor: row, slider };
+    }
+
+    /**
+     * Brightness and contrast for one monitor, side by side on one line, with
+     * the re-detect button closing the row.
+     *
+     * @param {object} monitor - The Monitor to bind to.
+     * @returns {object} The row actor.
+     * @private
+     */
+    _monitorRow(monitor) {
+        const row = new St.BoxLayout({ vertical: false, style: "spacing: 8px; padding: 2px 6px;" });
+        row.set_x_expand(true);
+
+        const pair = (iconName, onCommit) => {
+            row.add_child(
+                new St.Icon({
+                    icon_name: iconName,
+                    icon_type: St.IconType.SYMBOLIC,
+                    icon_size: 18,
+                })
+            );
+            const slider = this._makeSlider("5em");
+            slider.connect("drag-end", (s) => onCommit(Math.round(100 * s.value)));
+            row.add_child(slider.actor);
+            return slider;
+        };
+
+        monitor.menuSlider = pair("video-display-symbolic", (v) => monitor.setBrightness(v));
+        monitor.contrastSlider = pair("preferences-color-symbolic", (v) => monitor.setContrast(v));
+
+        row.add_child(
+            this._iconButton("emblem-synchronizing-symbolic", 16, () => {
+                if (this.detecting) {
+                    return;
+                }
+                const infoOSD = new ModalDialog.InfoOSD("Detecting displays...");
+                infoOSD.show();
+                this.updateMonitors(false).then(
+                    () => this.menu.open(true),
+                    (e) => global.logError("Error: " + e)
+                ).then(() => infoOSD.destroy());
+            })
+        );
+
+        monitor.updateMenu(); // push the values already read onto the sliders
+        return row;
     }
 
     /**
@@ -656,6 +752,32 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
+     * Fades and slides a freshly built panel into place.
+     *
+     * Deferred to an idle callback because Clutter's implicit animations only
+     * run once the actor has been added to the stage and allocated; easing in
+     * the same turn as construction produces no animation at all.
+     *
+     * @param {object} panel - The panel actor.
+     * @private
+     */
+    _animateIn(panel) {
+        panel.opacity = 0;
+        panel.translation_y = -12;
+        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            if (!panel.is_finalized()) {
+                panel.ease({
+                    opacity: 255,
+                    translation_y: 0,
+                    duration: 200,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                });
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    /**
      * One row inside an expansion panel: icon, name, and a trailing action.
      *
      * @param {string} iconName - Symbolic icon name.
@@ -675,7 +797,9 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 icon_size: 16,
             })
         );
-        row.add_child(new St.Label({ text: label, y_align: Clutter.ActorAlign.CENTER }));
+        const name = new St.Label({ text: label, y_align: Clutter.ActorAlign.CENTER });
+        name.clutter_text.ellipsize = Pango.EllipsizeMode.END;
+        row.add_child(name);
 
         const spacer = new St.Widget();
         spacer.set_x_expand(true);
@@ -712,14 +836,72 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
+     * A small uppercase heading used to split a panel into groups.
+     *
+     * @param {string} text - Heading text.
+     * @returns {object} A label actor.
+     * @private
+     */
+    _panelHeading(text) {
+        const label = new St.Label({ text: text.toUpperCase() });
+        label.set_style(
+            "font-size: 0.7em; font-weight: bold; padding: 6px 2px 1px 2px;" +
+            "color: rgba(255,255,255,0.45);"
+        );
+        return label;
+    }
+
+    /**
+     * Runs commands one after another and hands back all their output.
+     *
+     * @param {Array<string>} commands - Command lines.
+     * @param {Function} done - Receives an array of stdout strings.
+     * @private
+     */
+    _runAll(commands, done) {
+        const out = [];
+        const step = (i) => {
+            if (i >= commands.length) {
+                done(out);
+                return;
+            }
+            Util.spawnCommandLineAsyncIO(commands[i], (stdout) => {
+                out.push(String(stdout));
+                step(i + 1);
+            });
+        };
+        step(0);
+    }
+
+    /**
      * The inline panel a chevron opens: header, live list, settings link.
      *
-     * @param {string} key - Either "wifi" or "bluetooth".
+     * @param {string} key - "wifi", "bluetooth" or "audio".
      * @returns {object} The panel actor.
      * @private
      */
     _buildExpansionPanel(key) {
-        const isWifi = key === "wifi";
+        const meta = {
+            wifi: {
+                icon: "network-wireless-symbolic",
+                title: _("Wi-Fi"),
+                link: _("Wi-Fi Settings"),
+                command: "cinnamon-settings network",
+            },
+            bluetooth: {
+                icon: "bluetooth-symbolic",
+                title: _("Bluetooth"),
+                link: _("Bluetooth Settings"),
+                command: "blueman-manager",
+            },
+            audio: {
+                icon: "audio-volume-high-symbolic",
+                title: _("Sound"),
+                link: _("Sound Settings"),
+                command: "cinnamon-settings sound",
+            },
+        }[key];
+
         const panel = new St.BoxLayout({ vertical: true });
         panel.set_x_expand(true);
         panel.set_style(
@@ -730,7 +912,7 @@ class QuickSettingsApplet extends Applet.IconApplet {
         const header = new St.BoxLayout({ vertical: false, style: "spacing: 12px; padding-bottom: 4px;" });
         const badge = new St.Bin({
             child: new St.Icon({
-                icon_name: isWifi ? "network-wireless-symbolic" : "bluetooth-symbolic",
+                icon_name: meta.icon,
                 icon_type: St.IconType.SYMBOLIC,
                 icon_size: 18,
             }),
@@ -740,10 +922,7 @@ class QuickSettingsApplet extends Applet.IconApplet {
             "background-color: " + this.accent + ";"
         );
         header.add_child(badge);
-        const title = new St.Label({
-            text: isWifi ? _("Wi-Fi") : _("Bluetooth"),
-            y_align: Clutter.ActorAlign.CENTER,
-        });
+        const title = new St.Label({ text: meta.title, y_align: Clutter.ActorAlign.CENTER });
         title.set_style("font-size: 1.15em; font-weight: bold;");
         header.add_child(title);
         panel.add_child(header);
@@ -756,24 +935,101 @@ class QuickSettingsApplet extends Applet.IconApplet {
         rule.set_style("height: 1px; margin: 6px 0px; background-color: rgba(255,255,255,0.12);");
         panel.add_child(rule);
 
-        const link = new St.Button({
-            child: new St.Label({ text: isWifi ? _("Wi-Fi Settings") : _("Bluetooth Settings") }),
-        });
+        const link = new St.Button({ child: new St.Label({ text: meta.link }) });
         link.set_style("background-color: transparent; border: none; padding: 3px 2px;");
         link.connect("clicked", () => {
             this.menu.close(true);
-            Util.spawnCommandLine(isWifi ? "cinnamon-settings network" : "blueman-manager");
+            Util.spawnCommandLine(meta.command);
         });
         panel.add_child(link);
 
-        list.add_child(this._panelNote(_("Scanning...")));
-        if (isWifi) {
+        list.add_child(this._panelNote(_("Loading...")));
+        if (key === "wifi") {
             this._populateWifi(list);
-        } else {
+        } else if (key === "bluetooth") {
             this._populateBluetooth(list);
+        } else {
+            this._populateAudio(list);
         }
 
+        this._animateIn(panel);
         return panel;
+    }
+
+    /**
+     * Fills the Sound panel with output and input devices.
+     *
+     * @param {object} list - Container to populate.
+     * @private
+     */
+    _populateAudio(list) {
+        this._runAll(
+            ["pactl -f json list sinks", "pactl -f json list sources", "pactl info"],
+            ([sinkOut, sourceOut, info]) => {
+                if (list.is_finalized()) {
+                    return;
+                }
+                list.destroy_all_children();
+
+                const defaultOf = (label) => {
+                    const m = info.match(new RegExp("^" + label + ":\\s*(.+)$", "m"));
+                    return m ? m[1].trim() : "";
+                };
+                const parse = (json) => {
+                    try {
+                        return JSON.parse(json);
+                    } catch (e) {
+                        return [];
+                    }
+                };
+
+                const group = (heading, devices, current, iconName, setCommand) => {
+                    if (!devices.length) {
+                        return;
+                    }
+                    list.add_child(this._panelHeading(heading));
+                    devices.forEach((device) => {
+                        const isCurrent = device.name === current;
+                        list.add_child(
+                            this._panelRow(
+                                iconName,
+                                device.description || device.name,
+                                isCurrent ? _("Active") : _("Select"),
+                                () => {
+                                    if (isCurrent) {
+                                        return;
+                                    }
+                                    GLib.spawn_command_line_async(
+                                        setCommand + " " + GLib.shell_quote(device.name)
+                                    );
+                                    this.updateMenu();
+                                }
+                            )
+                        );
+                    });
+                };
+
+                group(
+                    _("Output"),
+                    parse(sinkOut),
+                    defaultOf("Default Sink"),
+                    "audio-speakers-symbolic",
+                    "pactl set-default-sink"
+                );
+                // .monitor sources are loopbacks of each sink, not real inputs.
+                group(
+                    _("Input"),
+                    parse(sourceOut).filter((s) => !String(s.name).endsWith(".monitor")),
+                    defaultOf("Default Source"),
+                    "audio-input-microphone-symbolic",
+                    "pactl set-default-source"
+                );
+
+                if (!list.get_n_children()) {
+                    list.add_child(this._panelNote(_("No audio devices found")));
+                }
+            }
+        );
     }
 
     /**
@@ -915,8 +1171,18 @@ class QuickSettingsApplet extends Applet.IconApplet {
 
         for (let i = 0; i < specs.length; i += 2) {
             const rowSpecs = specs.slice(i, i + 2);
-            const row = new St.BoxLayout({ vertical: false, style: "spacing: 8px;" });
-            row.set_x_expand(true);
+            // Clutter's BoxLayout rather than St's: only the layout manager
+            // exposes `homogeneous`, and without it every pill is sized to its
+            // own content, so "Do Not Disturb" comes out wider than "Night
+            // Light" and the grid never lines up.
+            const row = new Clutter.Actor({
+                layout_manager: new Clutter.BoxLayout({
+                    orientation: Clutter.Orientation.HORIZONTAL,
+                    homogeneous: true,
+                    spacing: 8,
+                }),
+                x_expand: true,
+            });
             rowSpecs.forEach((spec) => {
                 const tile = new QuickTile(spec, this.accent, {
                     onExpand: (key) => this._toggleExpansion(key),
@@ -938,8 +1204,8 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
-     * The slider stack: volume, panel backlight, then each DDC/CI monitor's
-     * brightness and contrast as bare icon-and-bar rows.
+     * The slider stack: volume (with its device chevron), panel backlight,
+     * then each DDC/CI monitor's brightness and contrast on a single line.
      *
      * @returns {object} The stack actor.
      * @private
@@ -948,27 +1214,21 @@ class QuickSettingsApplet extends Applet.IconApplet {
         const box = new St.BoxLayout({ vertical: true, style: "spacing: 4px;" });
         box.set_x_expand(true);
 
-        this.volumeRow = this._sliderRow("audio-volume-high-symbolic", (v) => this._setVolume(v));
+        this.volumeRow = this._sliderRow(
+            "audio-volume-high-symbolic",
+            (v) => this._setVolume(v),
+            "audio"
+        );
         box.add_child(this.volumeRow.actor);
+
+        if (this.expandedKey === "audio") {
+            box.add_child(this._buildExpansionPanel("audio"));
+        }
 
         this.panelRow = this._sliderRow("display-brightness-symbolic", (v) => setPanelBrightness(v));
         box.add_child(this.panelRow.actor);
 
-        this.monitors.forEach((monitor) => {
-            const brightness = this._sliderRow(
-                "video-display-symbolic",
-                (v) => monitor.setBrightness(v)
-            );
-            const contrast = this._sliderRow(
-                "preferences-color-symbolic",
-                (v) => monitor.setContrast(v)
-            );
-            monitor.menuSlider = brightness.slider;
-            monitor.contrastSlider = contrast.slider;
-            box.add_child(brightness.actor);
-            box.add_child(contrast.actor);
-            monitor.updateMenu(); // push the values already read onto them
-        });
+        this.monitors.forEach((monitor) => box.add_child(this._monitorRow(monitor)));
 
         return box;
     }
@@ -1000,27 +1260,6 @@ class QuickSettingsApplet extends Applet.IconApplet {
         shell.actor.set_style("padding: 0px;");
         shell.addActor(root, { span: -1, expand: true });
         this.menu.addMenuItem(shell);
-
-        const reload = new PopupMenu.PopupImageMenuItem(
-            "Refresh Displays",
-            "emblem-synchronizing-symbolic",
-            St.IconType.SYMBOLIC,
-            {
-                reactive: true,
-            }
-        );
-        reload.actor.set_style("padding: 4px 6px;");
-        this.menu.addMenuItem(reload);
-        reload.connect("activate", () => {
-            if (!this.detecting) {
-                const infoOSD = new ModalDialog.InfoOSD("Detecting displays...");
-                infoOSD.show();
-                this.updateMonitors(false).then(
-                    () => this.menu.open(true),
-                    (e) => global.logError("Error: " + e)
-                ).then(() => infoOSD.destroy());
-            }
-        });
 
         this.updateStatus();
     }
