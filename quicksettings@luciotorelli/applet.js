@@ -7,6 +7,7 @@ const ModalDialog = imports.ui.modalDialog;
 const Clutter = imports.gi.Clutter;
 const GLib = imports.gi.GLib;
 const Gio = imports.gi.Gio;
+const Pango = imports.gi.Pango;
 
 const DEFAULT_TOOLTIP = "Quick Settings";
 const BRIGHTNESS_ADJUSTMENT_STEP = 5;
@@ -134,15 +135,8 @@ class Monitor {
      * states its own percentage.
      */
     updateLabel() {
-        if (this.menuLabel) {
-            this.menuLabel.setLabel(this.name);
-        }
-        if (this.brightnessLabel) {
-            this.brightnessLabel.set_text(`Brightness (${this.brightness}%)`);
-        }
-        if (this.contrastLabel) {
-            this.contrastLabel.set_text(`Contrast (${this.contrast}%)`);
-        }
+        // The popup shows bare icon+bar rows now, so there are no captions to
+        // maintain. Kept as a hook so updateMenu() reads the same either way.
     }
 
     /**
@@ -196,114 +190,6 @@ class Monitor {
         });
     }
 
-    /**
-     * Builds one labelled slider, sized to sit alongside another on one line.
-     *
-     * @param {string} title - The caption above the slider ("Brightness").
-     * @param {number} initial - Starting value, 0-100.
-     * @param {Function} onPreview - Called with the live value while dragging.
-     * @param {Function} onCommit - Called with the final value on drag-end.
-     * @returns {object} `{ actor, label, slider }` for the caller to place.
-     * @private
-     */
-    _buildSliderColumn(title, initial, accent, onPreview, onCommit) {
-        const column = new St.BoxLayout({ vertical: true });
-        column.set_x_expand(true);
-
-        const label = new St.Label({ text: `${title} (${initial}%)` });
-        label.set_style("font-size: 0.9em; padding-left: 2px;");
-        column.add_child(label);
-
-        const slider = new PopupMenu.PopupSliderMenuItem(initial / 100);
-        // The stock .popup-slider-menu-item is min-width: 15em. Two of those on
-        // one line would force a ~30em popup, so halve it - the pair then fits
-        // in roughly the width the single stacked slider used to take.
-        //
-        // The track is also a 0.3em hairline by default. Thickening it and
-        // growing the handle is what reads as "modern" without custom Cairo
-        // drawing; these are the theme's own St properties, just overridden.
-        slider._slider.set_style(
-            "min-width: 7em;" +
-            "-slider-height: 0.5em;" +
-            "-slider-handle-radius: 0.55em;" +
-            `-slider-active-background-color: ${accent};` +
-            "-slider-background-color: rgba(255,255,255,0.12);"
-        );
-        // The slider is a menu item in its own right, so it arrives with the
-        // popup-menu-item padding already applied. Nested inside this row that
-        // padding is doubled up; drop it.
-        slider.actor.set_style("padding: 0px;");
-        slider.actor.set_x_expand(true);
-
-        slider.connect("value-changed", (s) => onPreview(Math.round(100 * s.value)));
-        slider.connect("drag-end", (s) => onCommit(Math.round(100 * s.value)));
-
-        column.add_child(slider.actor);
-        return { actor: column, label, slider };
-    }
-
-    /**
-     * Adds the monitor's brightness and contrast controls to the applet's popup menu.
-     *
-     * The two sliders share a single horizontal line - brightness on the left,
-     * contrast on the right - under a heading carrying the monitor's name.
-     *
-     * @param {object} menu - The menu to which the monitor's controls will be added.
-     * @param {string} accent - The theme accent colour for the slider fill.
-     */
-    addToMenu(menu, accent) {
-        // Monitor name, on its own line above the pair.
-        this.menuLabel = new PopupMenu.PopupMenuItem(this.name, {
-            reactive: false,
-        });
-        menu.addMenuItem(this.menuLabel);
-
-        const brightness = this._buildSliderColumn(
-            "Brightness",
-            this.brightness,
-            accent,
-            (value) => {
-                this.brightness = value;
-                this.updateLabel(); // Live readout while the handle is moving
-            },
-            (value) => this.setBrightness(value)
-        );
-
-        const contrast = this._buildSliderColumn(
-            "Contrast",
-            this.contrast,
-            accent,
-            (value) => {
-                this.contrast = value;
-                this.updateLabel();
-            },
-            (value) => this.setContrast(value)
-        );
-
-        this.brightnessLabel = brightness.label;
-        this.menuSlider = brightness.slider;
-        this.contrastLabel = contrast.label;
-        this.contrastSlider = contrast.slider;
-
-        // One row holding both columns side by side.
-        const row = new PopupMenu.PopupBaseMenuItem({
-            reactive: false,
-            activate: false,
-            hover: false,
-        });
-
-        const hbox = new St.BoxLayout({ vertical: false, style: "spacing: 16px;" });
-        hbox.set_x_expand(true);
-        hbox.add_child(brightness.actor);
-        hbox.add_child(contrast.actor);
-
-        // span: -1 gives the box the full width of the row rather than one
-        // column of the menu item's internal column layout.
-        row.addActor(hbox, { span: -1, expand: true });
-        menu.addMenuItem(row);
-
-        this.updateLabel();
-    }
 }
 /**
  * Reads the laptop panel backlight through the Cinnamon settings daemon.
@@ -382,17 +268,19 @@ function setBool(schema, key, value) {
 /**
  * A GNOME-style quick settings pill.
  *
- * Two click targets in one rounded tile: the body and, where the spec supplies
- * an onOpen, a chevron behind a hairline divider. Which half does what is
- * decided by BODY_TOGGLES.
+ * Two visually distinct segments in one rounded tile: the body, and - where
+ * the spec offers somewhere to go - a chevron with its own background behind
+ * a hairline divider, rounded to match the pill's right edge. St does not clip
+ * children to a parent's border-radius, so the chevron carries its own
+ * radius rather than relying on the tile to mask it.
  */
 class QuickTile {
     /**
-     * @param {object} spec - Tile definition (icon, title, onToggle, onOpen).
+     * @param {object} spec - Tile definition.
      * @param {string} accent - Theme accent used for the active state.
-     * @param {object} menu - Popup menu, closed before launching anything.
+     * @param {object} handlers - `{ onExpand, onLaunch }` callbacks.
      */
-    constructor(spec, accent, menu) {
+    constructor(spec, accent, handlers) {
         this.spec = spec;
         this.accent = accent;
         this.active = false;
@@ -413,6 +301,9 @@ class QuickTile {
         this.titleLabel = new St.Label({ text: spec.title });
         text.add_child(this.titleLabel);
         this.subtitleLabel = new St.Label({ text: "" });
+        // The SSID lands after the tile is laid out; without this it would be
+        // ellipsized to fit the empty placeholder's width.
+        this.subtitleLabel.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
         this.subtitleLabel.hide();
         text.add_child(this.subtitleLabel);
         inner.add_child(text);
@@ -421,22 +312,21 @@ class QuickTile {
             this.setActive(!this.active);
             spec.onToggle(this.active);
         };
-        const openAction = spec.onOpen
-            ? () => {
-                  menu.close(true);
-                  spec.onOpen();
-              }
+        // The chevron either expands an inline panel or launches an app.
+        const chevronAction = spec.expand
+            ? () => handlers.onExpand(spec.expand)
+            : spec.onOpen
+            ? () => handlers.onLaunch(spec.onOpen)
             : null;
 
         this.body = new St.Button({ child: inner, x_expand: true });
-        this.body.set_style("background-color: transparent; border: none; padding: 0px;");
         this.body.connect(
             "clicked",
-            BODY_TOGGLES || !openAction ? toggleAction : openAction
+            BODY_TOGGLES || !chevronAction ? toggleAction : chevronAction
         );
         this.actor.add_child(this.body);
 
-        if (openAction) {
+        if (chevronAction) {
             this.chevron = new St.Button({
                 child: new St.Icon({
                     icon_name: "go-next-symbolic",
@@ -444,7 +334,10 @@ class QuickTile {
                     icon_size: 14,
                 }),
             });
-            this.chevron.connect("clicked", BODY_TOGGLES ? openAction : toggleAction);
+            this.chevron.connect(
+                "clicked",
+                BODY_TOGGLES ? chevronAction : toggleAction
+            );
             this.actor.add_child(this.chevron);
         }
 
@@ -472,14 +365,19 @@ class QuickTile {
             ? TILE_HOVER
             : TILE_IDLE;
 
+        // No padding on the tile itself - each segment pads its own content, so
+        // the chevron's background reaches the pill edge.
         this.actor.set_style(
-            "padding: 10px 14px; spacing: 8px; transition-duration: 150;" +
+            "padding: 0px; transition-duration: 150;" +
             "border-radius: " + TILE_PILL_RADIUS + "px;" +
             "background-color: " + background + ";"
         );
+        this.body.set_style(
+            "background-color: transparent; border: none;" +
+            "padding: 9px 14px;" +
+            "border-radius: " + TILE_PILL_RADIUS + "px 0px 0px " + TILE_PILL_RADIUS + "px;"
+        );
 
-        // Only force a colour while active. Clearing it otherwise lets the
-        // theme decide, so this still reads correctly on a light theme.
         if (this.active) {
             this.titleLabel.set_style("font-weight: bold; color: #ffffff;");
             this.subtitleLabel.set_style("font-size: 0.8em; color: rgba(255,255,255,0.8);");
@@ -491,11 +389,20 @@ class QuickTile {
         }
 
         if (this.chevron) {
+            // Darken over the accent, lighten over the idle grey - either way
+            // the segment separates from the body without inventing a colour.
+            const segment = this.active
+                ? "rgba(0,0,0,0.20)"
+                : "rgba(255,255,255,0.07)";
+            const divider = this.active
+                ? "rgba(255,255,255,0.30)"
+                : "rgba(255,255,255,0.14)";
             this.chevron.set_style(
-                "background-color: transparent; padding: 0px 2px 0px 10px; margin-left: 6px;" +
-                "border-left: 1px solid " +
-                (this.active ? "rgba(255,255,255,0.35)" : "rgba(255,255,255,0.18)") +
-                ";"
+                "padding: 9px 13px;" +
+                "background-color: " + segment + ";" +
+                "border-left: 1px solid " + divider + ";" +
+                "border-radius: 0px " + TILE_PILL_RADIUS + "px " + TILE_PILL_RADIUS + "px 0px;" +
+                (this.active ? "color: #ffffff;" : "")
             );
         }
     }
@@ -548,6 +455,7 @@ class QuickSettingsApplet extends Applet.IconApplet {
         this.lastTooltipTimeoutID = null;
         this.monitors = [];
         this.tiles = {};
+        this.expandedKey = null;
 
         this.menuManager = new PopupMenu.PopupMenuManager(this);
         this.menu = new Applet.AppletPopupMenu(this, orientation);
@@ -566,28 +474,6 @@ class QuickSettingsApplet extends Applet.IconApplet {
         this.accent = themeAccent();
         this.updateMenu();
         this.updateMonitors();
-    }
-
-    /**
-     * A dim uppercase caption used to group the popup into sections.
-     *
-     * @param {string} text - The heading text.
-     * @returns {object} A non-interactive menu item.
-     * @private
-     */
-    _sectionHeader(text) {
-        const item = new PopupMenu.PopupBaseMenuItem({
-            reactive: false,
-            activate: false,
-            hover: false,
-        });
-        const label = new St.Label({ text: text.toUpperCase() });
-        label.set_style(
-            "font-size: 0.72em; font-weight: bold; padding: 2px;" +
-            "color: rgba(255,255,255,0.45);"
-        );
-        item.addActor(label, { span: -1 });
-        return item;
     }
 
     /**
@@ -647,6 +533,10 @@ class QuickSettingsApplet extends Applet.IconApplet {
             text: "--%",
             y_align: Clutter.ActorAlign.CENTER,
         });
+        // The percentage arrives asynchronously, after this pill has already
+        // been allocated for the placeholder. Without this the longer text is
+        // ellipsized to "..." rather than triggering a relayout.
+        this.batteryLabel.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
         battery.add_child(this.batteryLabel);
         row.add_child(battery);
 
@@ -702,6 +592,8 @@ class QuickSettingsApplet extends Applet.IconApplet {
     /**
      * The toggle pills, in the order they appear in the grid.
      *
+     * `expand` opens an inline panel; `onOpen` launches an app instead.
+     *
      * @returns {Array<object>} Tile specs.
      * @private
      */
@@ -711,15 +603,15 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 key: "wifi",
                 icon: "network-wireless-symbolic",
                 title: _("Wi-Fi"),
+                expand: "wifi",
                 onToggle: (state) => this._setWifi(state),
-                onOpen: () => Util.spawnCommandLine("cinnamon-settings network"),
             },
             {
                 key: "bluetooth",
                 icon: "bluetooth-symbolic",
                 title: _("Bluetooth"),
+                expand: "bluetooth",
                 onToggle: (state) => this._setBluetooth(state),
-                onOpen: () => Util.spawnCommandLine("blueman-manager"),
             },
             {
                 key: "nightlight",
@@ -727,7 +619,7 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 title: _("Night Light"),
                 onToggle: (state) =>
                     setBool("org.cinnamon.settings-daemon.plugins.color", "night-light-enabled", state),
-                onOpen: () => Util.spawnCommandLine("cinnamon-settings nightlight"),
+                onOpen: "cinnamon-settings nightlight",
             },
             {
                 key: "dnd",
@@ -753,7 +645,265 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
-     * Lays the tile specs out two to a row.
+     * Opens or closes an inline panel, then redraws.
+     *
+     * @param {string} key - Panel key, or the open one to close it.
+     * @private
+     */
+    _toggleExpansion(key) {
+        this.expandedKey = this.expandedKey === key ? null : key;
+        this.updateMenu();
+    }
+
+    /**
+     * One row inside an expansion panel: icon, name, and a trailing action.
+     *
+     * @param {string} iconName - Symbolic icon name.
+     * @param {string} label - Row text.
+     * @param {string} actionText - Trailing button caption.
+     * @param {Function} onAction - Click handler.
+     * @returns {object} The row actor.
+     * @private
+     */
+    _panelRow(iconName, label, actionText, onAction) {
+        const row = new St.BoxLayout({ vertical: false, style: "spacing: 10px; padding: 3px 2px;" });
+        row.set_x_expand(true);
+        row.add_child(
+            new St.Icon({
+                icon_name: iconName,
+                icon_type: St.IconType.SYMBOLIC,
+                icon_size: 16,
+            })
+        );
+        row.add_child(new St.Label({ text: label, y_align: Clutter.ActorAlign.CENTER }));
+
+        const spacer = new St.Widget();
+        spacer.set_x_expand(true);
+        row.add_child(spacer);
+
+        const action = new St.Button({
+            child: new St.Label({ text: actionText, y_align: Clutter.ActorAlign.CENTER }),
+        });
+        const paint = (hovered) =>
+            action.set_style(
+                "border: none; padding: 3px 8px; border-radius: 10px;" +
+                "background-color: " + (hovered ? TILE_HOVER : "transparent") + ";"
+            );
+        paint(false);
+        action.connect("enter-event", () => paint(true));
+        action.connect("leave-event", () => paint(false));
+        action.connect("clicked", onAction);
+        row.add_child(action);
+
+        return row;
+    }
+
+    /**
+     * A dim one-line message used when a panel list is empty.
+     *
+     * @param {string} text - Message.
+     * @returns {object} A label actor.
+     * @private
+     */
+    _panelNote(text) {
+        const label = new St.Label({ text: text });
+        label.set_style("padding: 4px 2px; color: rgba(255,255,255,0.45);");
+        return label;
+    }
+
+    /**
+     * The inline panel a chevron opens: header, live list, settings link.
+     *
+     * @param {string} key - Either "wifi" or "bluetooth".
+     * @returns {object} The panel actor.
+     * @private
+     */
+    _buildExpansionPanel(key) {
+        const isWifi = key === "wifi";
+        const panel = new St.BoxLayout({ vertical: true });
+        panel.set_x_expand(true);
+        panel.set_style(
+            "padding: 12px 14px; border-radius: 18px; spacing: 6px;" +
+            "background-color: rgba(255,255,255,0.06);"
+        );
+
+        const header = new St.BoxLayout({ vertical: false, style: "spacing: 12px; padding-bottom: 4px;" });
+        const badge = new St.Bin({
+            child: new St.Icon({
+                icon_name: isWifi ? "network-wireless-symbolic" : "bluetooth-symbolic",
+                icon_type: St.IconType.SYMBOLIC,
+                icon_size: 18,
+            }),
+        });
+        badge.set_style(
+            "width: 34px; height: 34px; border-radius: 17px; color: #ffffff;" +
+            "background-color: " + this.accent + ";"
+        );
+        header.add_child(badge);
+        const title = new St.Label({
+            text: isWifi ? _("Wi-Fi") : _("Bluetooth"),
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        title.set_style("font-size: 1.15em; font-weight: bold;");
+        header.add_child(title);
+        panel.add_child(header);
+
+        const list = new St.BoxLayout({ vertical: true, style: "spacing: 1px;" });
+        list.set_x_expand(true);
+        panel.add_child(list);
+
+        const rule = new St.Widget();
+        rule.set_style("height: 1px; margin: 6px 0px; background-color: rgba(255,255,255,0.12);");
+        panel.add_child(rule);
+
+        const link = new St.Button({
+            child: new St.Label({ text: isWifi ? _("Wi-Fi Settings") : _("Bluetooth Settings") }),
+        });
+        link.set_style("background-color: transparent; border: none; padding: 3px 2px;");
+        link.connect("clicked", () => {
+            this.menu.close(true);
+            Util.spawnCommandLine(isWifi ? "cinnamon-settings network" : "blueman-manager");
+        });
+        panel.add_child(link);
+
+        list.add_child(this._panelNote(_("Scanning...")));
+        if (isWifi) {
+            this._populateWifi(list);
+        } else {
+            this._populateBluetooth(list);
+        }
+
+        return panel;
+    }
+
+    /**
+     * Fills the Wi-Fi panel with nearby networks.
+     *
+     * @param {object} list - Container to populate.
+     * @private
+     */
+    _populateWifi(list) {
+        // SSID goes last so a name containing a colon cannot break the split.
+        Util.spawnCommandLineAsyncIO("nmcli -t -f IN-USE,SIGNAL,SSID dev wifi", (stdout) => {
+            if (list.is_finalized()) {
+                return;
+            }
+            list.destroy_all_children();
+
+            const best = new Map();
+            String(stdout).split("\n").forEach((line) => {
+                const parts = line.match(/^([^:]*):([^:]*):(.*)$/);
+                if (!parts) {
+                    return;
+                }
+                const ssid = parts[3].replace(/\\:/g, ":").trim();
+                if (!ssid) {
+                    return; // hidden network, nothing to label it with
+                }
+                const signal = parseInt(parts[2], 10) || 0;
+                const inUse = parts[1].trim() === "*";
+                const prev = best.get(ssid);
+                // The same SSID appears once per band and per AP; keep the
+                // strongest, and let any in-use sighting win.
+                best.set(ssid, {
+                    ssid: ssid,
+                    signal: Math.max(signal, prev ? prev.signal : 0),
+                    inUse: inUse || (prev ? prev.inUse : false),
+                });
+            });
+
+            const networks = Array.from(best.values())
+                .sort((a, b) => (b.inUse - a.inUse) || (b.signal - a.signal))
+                .slice(0, 6);
+
+            if (!networks.length) {
+                list.add_child(this._panelNote(_("No networks found")));
+                return;
+            }
+
+            networks.forEach((net) => {
+                const quoted = GLib.shell_quote(net.ssid);
+                list.add_child(
+                    this._panelRow(
+                        net.signal > 60
+                            ? "network-wireless-signal-excellent-symbolic"
+                            : "network-wireless-signal-weak-symbolic",
+                        net.ssid,
+                        net.inUse ? _("Disconnect") : _("Connect"),
+                        () => {
+                            GLib.spawn_command_line_async(
+                                net.inUse
+                                    ? "nmcli con down id " + quoted
+                                    : "nmcli dev wifi connect " + quoted
+                            );
+                            this.menu.close(true);
+                        }
+                    )
+                );
+            });
+        });
+    }
+
+    /**
+     * Fills the Bluetooth panel with paired devices.
+     *
+     * @param {object} list - Container to populate.
+     * @private
+     */
+    _populateBluetooth(list) {
+        Util.spawnCommandLineAsyncIO("bluetoothctl devices Paired", (stdout) => {
+            if (list.is_finalized()) {
+                return;
+            }
+            const devices = String(stdout)
+                .split("\n")
+                .map((line) => line.match(/^Device\s+(\S+)\s+(.*)$/))
+                .filter(Boolean)
+                .map((m) => ({ mac: m[1], name: m[2].trim() }));
+
+            Util.spawnCommandLineAsyncIO("bluetoothctl devices Connected", (out) => {
+                if (list.is_finalized()) {
+                    return;
+                }
+                list.destroy_all_children();
+
+                if (!devices.length) {
+                    list.add_child(this._panelNote(_("No paired devices")));
+                    return;
+                }
+
+                const connected = new Set(
+                    String(out)
+                        .split("\n")
+                        .map((line) => (line.match(/^Device\s+(\S+)/) || [])[1])
+                        .filter(Boolean)
+                );
+
+                devices.forEach((device) => {
+                    const isOn = connected.has(device.mac);
+                    list.add_child(
+                        this._panelRow(
+                            "bluetooth-symbolic",
+                            device.name,
+                            isOn ? _("Disconnect") : _("Connect"),
+                            () => {
+                                GLib.spawn_command_line_async(
+                                    "bluetoothctl " +
+                                        (isOn ? "disconnect " : "connect ") +
+                                        device.mac
+                                );
+                                this.menu.close(true);
+                            }
+                        )
+                    );
+                });
+            });
+        });
+    }
+
+    /**
+     * Lays the tile specs out two to a row, dropping any open panel directly
+     * beneath the row that owns it.
      *
      * @returns {object} The grid actor.
      * @private
@@ -764,16 +914,63 @@ class QuickSettingsApplet extends Applet.IconApplet {
         grid.set_x_expand(true);
 
         for (let i = 0; i < specs.length; i += 2) {
+            const rowSpecs = specs.slice(i, i + 2);
             const row = new St.BoxLayout({ vertical: false, style: "spacing: 8px;" });
             row.set_x_expand(true);
-            specs.slice(i, i + 2).forEach((spec) => {
-                const tile = new QuickTile(spec, this.accent, this.menu);
+            rowSpecs.forEach((spec) => {
+                const tile = new QuickTile(spec, this.accent, {
+                    onExpand: (key) => this._toggleExpansion(key),
+                    onLaunch: (command) => {
+                        this.menu.close(true);
+                        Util.spawnCommandLine(command);
+                    },
+                });
                 this.tiles[spec.key] = tile;
                 row.add_child(tile.actor);
             });
             grid.add_child(row);
+
+            if (this.expandedKey && rowSpecs.some((s) => s.expand === this.expandedKey)) {
+                grid.add_child(this._buildExpansionPanel(this.expandedKey));
+            }
         }
         return grid;
+    }
+
+    /**
+     * The slider stack: volume, panel backlight, then each DDC/CI monitor's
+     * brightness and contrast as bare icon-and-bar rows.
+     *
+     * @returns {object} The stack actor.
+     * @private
+     */
+    _buildSliderStack() {
+        const box = new St.BoxLayout({ vertical: true, style: "spacing: 4px;" });
+        box.set_x_expand(true);
+
+        this.volumeRow = this._sliderRow("audio-volume-high-symbolic", (v) => this._setVolume(v));
+        box.add_child(this.volumeRow.actor);
+
+        this.panelRow = this._sliderRow("display-brightness-symbolic", (v) => setPanelBrightness(v));
+        box.add_child(this.panelRow.actor);
+
+        this.monitors.forEach((monitor) => {
+            const brightness = this._sliderRow(
+                "video-display-symbolic",
+                (v) => monitor.setBrightness(v)
+            );
+            const contrast = this._sliderRow(
+                "preferences-color-symbolic",
+                (v) => monitor.setContrast(v)
+            );
+            monitor.menuSlider = brightness.slider;
+            monitor.contrastSlider = contrast.slider;
+            box.add_child(brightness.actor);
+            box.add_child(contrast.actor);
+            monitor.updateMenu(); // push the values already read onto them
+        });
+
+        return box;
     }
 
     /**
@@ -783,19 +980,16 @@ class QuickSettingsApplet extends Applet.IconApplet {
         this.menu.removeAll();
         this.tiles = {};
 
-        const root = new St.BoxLayout({ vertical: true, style: "spacing: 12px; padding: 6px 8px;" });
+        // Trim the stock chrome: .popup-menu-content pads 1em top and bottom,
+        // and .popup-menu-item pads 1.75em left and right, which leaves a wide
+        // dead margin around a grid like this one.
+        this.menu.box.set_style("padding: 8px;");
+
+        const root = new St.BoxLayout({ vertical: true, style: "spacing: 10px;" });
         root.set_x_expand(true);
 
         root.add_child(this._buildHeader());
-
-        const sliders = new St.BoxLayout({ vertical: true, style: "spacing: 8px;" });
-        sliders.set_x_expand(true);
-        this.volumeRow = this._sliderRow("audio-volume-high-symbolic", (v) => this._setVolume(v));
-        this.panelRow = this._sliderRow("display-brightness-symbolic", (v) => setPanelBrightness(v));
-        sliders.add_child(this.volumeRow.actor);
-        sliders.add_child(this.panelRow.actor);
-        root.add_child(sliders);
-
+        root.add_child(this._buildSliderStack());
         root.add_child(this._buildTileGrid());
 
         const shell = new PopupMenu.PopupBaseMenuItem({
@@ -803,14 +997,9 @@ class QuickSettingsApplet extends Applet.IconApplet {
             activate: false,
             hover: false,
         });
+        shell.actor.set_style("padding: 0px;");
         shell.addActor(root, { span: -1, expand: true });
         this.menu.addMenuItem(shell);
-
-        // DDC/CI monitors keep their own section below the grid.
-        if (this.monitors.length > 0) {
-            this.menu.addMenuItem(this._sectionHeader("Displays"));
-            this.monitors.forEach((monitor) => monitor.addToMenu(this.menu, this.accent));
-        }
 
         const reload = new PopupMenu.PopupImageMenuItem(
             "Refresh Displays",
@@ -820,6 +1009,7 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 reactive: true,
             }
         );
+        reload.actor.set_style("padding: 4px 6px;");
         this.menu.addMenuItem(reload);
         reload.connect("activate", () => {
             if (!this.detecting) {
@@ -987,9 +1177,13 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 return;
             }
             const base = "/sys/class/power_supply/" + name + "/";
+            const decoder = new TextDecoder();
             const read = (file) => {
                 const [ok, contents] = GLib.file_get_contents(base + file);
-                return ok ? String(contents).trim() : "";
+                // decode(), not String(): file_get_contents hands back a
+                // Uint8Array, and stringifying one is the deprecated path GJS
+                // warns about on every call.
+                return ok ? decoder.decode(contents).trim() : "";
             };
             this.batteryLabel.set_text(read("capacity") + "%");
             if (this.batteryIcon) {
