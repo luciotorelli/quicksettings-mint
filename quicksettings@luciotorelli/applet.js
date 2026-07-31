@@ -8,6 +8,7 @@ const Clutter = imports.gi.Clutter;
 const GLib = imports.gi.GLib;
 const Gio = imports.gi.Gio;
 const Pango = imports.gi.Pango;
+const Meta = imports.gi.Meta;
 
 const DEFAULT_TOOLTIP = "Quick Settings";
 const BRIGHTNESS_ADJUSTMENT_STEP = 5;
@@ -31,6 +32,11 @@ const ACCENT_FALLBACK = "rgb(255,113,57)";
 // Panel reveal. EASE_OUT_BACK overshoots a touch at the end, which is what
 // makes the reveal read as a snap; fall back if this build lacks the mode.
 const PANEL_ANIM_MS = 320;
+
+// Rough row counts, used only to reserve height the first time a panel opens
+// before its cache is warm, so the popup does not resize twice.
+const PANEL_EXPECTED_ROWS = { wifi: 6, bluetooth: 2, audio: 5, power: 3, fan: 7 };
+const PANEL_ROW_PX = 27;
 const PANEL_ANIM_MODE =
     Clutter.AnimationMode.EASE_OUT_BACK || Clutter.AnimationMode.EASE_OUT_QUAD;
 
@@ -527,6 +533,9 @@ class QuickSettingsApplet extends Applet.IconApplet {
         this.monitors = [];
         this.tiles = {};
         this.expandedKey = null;
+        this.panelCache = {};   // key -> row descriptors, warmed on open
+        this.panelSlots = {};   // key -> { host, index } for insertion
+        this.panelActor = null;
 
         this.menuManager = new PopupMenu.PopupMenuManager(this);
         this.menu = new Applet.AppletPopupMenu(this, orientation);
@@ -811,33 +820,105 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
-     * Opens or closes an inline panel, then redraws.
+     * Opens or closes an inline panel.
      *
      * @param {string} key - Panel key, or the open one to close it.
      * @private
      */
     _toggleExpansion(key) {
         this.expandedKey = this.expandedKey === key ? null : key;
-        this.updateMenu();
+        this._syncExpansion();
+    }
+
+    /**
+     * Swaps the open panel in or out without rebuilding the rest of the popup.
+     *
+     * This used to call updateMenu(), which tore down and recreated every
+     * widget - header, sliders, all six pills - and then re-read the whole
+     * system state, spawning about eight processes. All of that ran before the
+     * animation got a chance to start, which is what made the reveal look
+     * frozen. Only the panel actually changes, so only the panel is touched.
+     *
+     * @private
+     */
+    _syncExpansion() {
+        if (this.panelActor && !this.panelActor.is_finalized()) {
+            this.panelActor.destroy();
+        }
+        this.panelActor = null;
+
+        if (!this.expandedKey) {
+            return;
+        }
+        const slot = this.panelSlots[this.expandedKey];
+        if (!slot || slot.host.is_finalized()) {
+            return;
+        }
+        this.panelActor = this._buildExpansionPanel(this.expandedKey);
+        slot.host.insert_child_at_index(this.panelActor, slot.index);
+    }
+
+    /**
+     * Warms the panel caches shortly after the popup opens.
+     *
+     * A cold panel has to shell out before it knows its own contents, so it
+     * would open at placeholder height and resize once the rows landed. By the
+     * time a chevron is actually clicked this has usually finished, so the
+     * panel renders at its true size immediately.
+     *
+     * The fetches are staggered rather than fired together: five panels is a
+     * dozen subprocesses, and launching them in one go stutters the very frame
+     * the popup is trying to draw.
+     *
+     * @private
+     */
+    _prefetchPanels() {
+        ["power", "fan", "audio", "wifi", "bluetooth"].forEach((key, i) => {
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, 120 * i, () => {
+                if (this.menu.isOpen) {
+                    this._fetchPanel(key, (rows) => {
+                        this.panelCache[key] = rows;
+                    });
+                }
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+    }
+
+    /**
+     * Re-reads one panel after an action changed the thing it lists.
+     *
+     * @param {string} key - Panel to invalidate.
+     * @private
+     */
+    _invalidatePanel(key) {
+        delete this.panelCache[key];
+        // Let the command land before asking what changed.
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 350, () => {
+            if (this.expandedKey === key) {
+                this._syncExpansion();
+            }
+            this.updateStatus();
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     /**
      * Animates a freshly built panel into place.
      *
-     * Three properties together, because opacity alone was barely perceptible:
-     * it fades up, rises a clear 22px, and scales from 92% about its top edge
-     * so the growth reads as the panel pushing the rows below it apart.
-     * EASE_OUT_BACK overshoots very slightly at the end, which is what gives
-     * it a snap rather than a drift.
+     * Three properties at once, because opacity alone was barely perceptible:
+     * it fades up, rises 22px, and scales from 92% about its top edge so the
+     * growth reads as the panel pushing the rows below it apart.
+     * EASE_OUT_BACK overshoots very slightly at the end, which gives it a snap
+     * rather than a drift.
      *
-     * Height is deliberately not animated: the list inside is populated
-     * asynchronously, so its natural height at this point is only that of the
-     * "Loading..." placeholder, and tweening to it would just produce a jump
-     * when the real rows arrive.
+     * Scheduled on BEFORE_REDRAW rather than an idle callback: idle runs
+     * whenever the main loop happens to drain, so any work still queued
+     * delayed the start and read as a stall. This fires on the next frame.
      *
-     * Deferred to an idle callback because Clutter's implicit animations only
-     * run once the actor is on the stage and allocated; easing in the same
-     * turn as construction animates nothing at all.
+     * Height is deliberately not animated. The list can still be loading, so
+     * its natural height may only be the placeholder's, and tweening to that
+     * produces a jump when the real rows arrive.
      *
      * @param {object} panel - The panel actor.
      * @private
@@ -849,7 +930,7 @@ class QuickSettingsApplet extends Applet.IconApplet {
         panel.scale_y = 0.92;
         panel.scale_x = 0.98;
 
-        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+        Meta.later_add(Meta.LaterType.BEFORE_REDRAW, () => {
             if (!panel.is_finalized()) {
                 panel.ease({
                     opacity: 255,
@@ -860,7 +941,7 @@ class QuickSettingsApplet extends Applet.IconApplet {
                     mode: PANEL_ANIM_MODE,
                 });
             }
-            return GLib.SOURCE_REMOVE;
+            return false;
         });
     }
 
@@ -961,9 +1042,52 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
-     * The inline panel a chevron opens: header, live list, settings link.
+     * Turns row descriptors into actors.
      *
-     * @param {string} key - "wifi", "bluetooth" or "audio".
+     * Panels are described as plain data so a result can be cached and
+     * re-rendered instantly on the next open.
+     *
+     * @param {object} list - Container to fill.
+     * @param {Array<object>} rows - Descriptors.
+     * @private
+     */
+    _renderRows(list, rows) {
+        list.destroy_all_children();
+        rows.forEach((row) => {
+            if (row.kind === "heading") {
+                list.add_child(this._panelHeading(row.text));
+            } else if (row.kind === "note") {
+                list.add_child(this._panelNote(row.text));
+            } else {
+                list.add_child(this._panelRow(row.icon, row.label, row.action, row.run));
+            }
+        });
+    }
+
+    /**
+     * Dispatches to the right fetcher for a panel.
+     *
+     * @param {string} key - Panel key.
+     * @param {Function} cb - Receives an array of row descriptors.
+     * @private
+     */
+    _fetchPanel(key, cb) {
+        const fetchers = {
+            wifi: (c) => this._fetchWifi(c),
+            bluetooth: (c) => this._fetchBluetooth(c),
+            audio: (c) => this._fetchAudio(c),
+            power: (c) => this._fetchPower(c),
+            fan: (c) => this._fetchFan(c),
+        };
+        if (fetchers[key]) {
+            fetchers[key](cb);
+        }
+    }
+
+    /**
+     * The inline panel a chevron opens: header, live list, footer action.
+     *
+     * @param {string} key - Panel key.
      * @returns {object} The panel actor.
      * @private
      */
@@ -974,28 +1098,24 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 title: _("Wi-Fi"),
                 link: _("Wi-Fi Settings"),
                 command: "cinnamon-settings network",
-                populate: (list) => this._populateWifi(list),
             },
             bluetooth: {
                 icon: "bluetooth-symbolic",
                 title: _("Bluetooth"),
                 link: _("Bluetooth Settings"),
                 command: "blueman-manager",
-                populate: (list) => this._populateBluetooth(list),
             },
             audio: {
                 icon: "audio-volume-high-symbolic",
                 title: _("Sound"),
                 link: _("Sound Settings"),
                 command: "cinnamon-settings sound",
-                populate: (list) => this._populateAudio(list),
             },
             power: {
                 icon: "power-profile-balanced-symbolic",
                 title: _("Power Mode"),
                 link: _("Power Settings"),
                 command: "cinnamon-settings power",
-                populate: (list) => this._populatePower(list),
             },
             fan: {
                 icon: "weather-windy-symbolic",
@@ -1005,9 +1125,8 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 link: _("Reset to Default"),
                 onLink: () => {
                     GLib.spawn_command_line_async("fw-fanctrl reset");
-                    this.updateMenu();
+                    this._invalidatePanel("fan");
                 },
-                populate: (list) => this._populateFan(list),
             },
         }[key];
 
@@ -1056,28 +1175,41 @@ class QuickSettingsApplet extends Applet.IconApplet {
         });
         panel.add_child(link);
 
-        list.add_child(this._panelNote(_("Loading...")));
-        meta.populate(list);
+        if (this.panelCache[key]) {
+            // Warm: render at true size straight away, no resize to come.
+            this._renderRows(list, this.panelCache[key]);
+        } else {
+            // Cold: hold roughly the right amount of room so the popup settles
+            // once rather than growing under the pointer.
+            const reserve = new St.Widget();
+            reserve.set_style(
+                "height: " + (PANEL_EXPECTED_ROWS[key] || 3) * PANEL_ROW_PX + "px;"
+            );
+            list.add_child(reserve);
+        }
+
+        this._fetchPanel(key, (rows) => {
+            this.panelCache[key] = rows;
+            if (!list.is_finalized()) {
+                this._renderRows(list, rows);
+            }
+        });
 
         this._animateIn(panel);
         return panel;
     }
 
     /**
-     * Fills the Sound panel with output and input devices.
+     * Builds the Sound panel's rows from pactl.
      *
-     * @param {object} list - Container to populate.
+     * @param {Function} cb - Receives row descriptors.
      * @private
      */
-    _populateAudio(list) {
+    _fetchAudio(cb) {
         this._runAll(
             ["pactl -f json list sinks", "pactl -f json list sources", "pactl info"],
             ([sinkOut, sourceOut, info]) => {
-                if (list.is_finalized()) {
-                    return;
-                }
-                list.destroy_all_children();
-
+                const rows = [];
                 const defaultOf = (label) => {
                     const m = info.match(new RegExp("^" + label + ":\\s*(.+)$", "m"));
                     return m ? m[1].trim() : "";
@@ -1090,29 +1222,28 @@ class QuickSettingsApplet extends Applet.IconApplet {
                     }
                 };
 
-                const group = (heading, devices, current, iconName, setCommand) => {
+                const group = (heading, devices, current, iconName, setCommand, key) => {
                     if (!devices.length) {
                         return;
                     }
-                    list.add_child(this._panelHeading(heading));
+                    rows.push({ kind: "heading", text: heading });
                     devices.forEach((device) => {
                         const isCurrent = device.name === current;
-                        list.add_child(
-                            this._panelRow(
-                                iconName,
-                                device.description || device.name,
-                                isCurrent ? _("Active") : _("Select"),
-                                () => {
-                                    if (isCurrent) {
-                                        return;
-                                    }
-                                    GLib.spawn_command_line_async(
-                                        setCommand + " " + GLib.shell_quote(device.name)
-                                    );
-                                    this.updateMenu();
+                        rows.push({
+                            kind: "row",
+                            icon: iconName,
+                            label: device.description || device.name,
+                            action: isCurrent ? _("Active") : _("Select"),
+                            run: () => {
+                                if (isCurrent) {
+                                    return;
                                 }
-                            )
-                        );
+                                GLib.spawn_command_line_async(
+                                    setCommand + " " + GLib.shell_quote(device.name)
+                                );
+                                this._invalidatePanel("audio");
+                            },
+                        });
                     });
                 };
 
@@ -1126,83 +1257,71 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 // .monitor sources are loopbacks of each sink, not real inputs.
                 group(
                     _("Input"),
-                    parse(sourceOut).filter((s) => !String(s.name).endsWith(".monitor")),
+                    parse(sourceOut).filter((d) => !String(d.name).endsWith(".monitor")),
                     defaultOf("Default Source"),
                     "audio-input-microphone-symbolic",
                     "pactl set-default-source"
                 );
 
-                if (!list.get_n_children()) {
-                    list.add_child(this._panelNote(_("No audio devices found")));
+                if (!rows.length) {
+                    rows.push({ kind: "note", text: _("No audio devices found") });
                 }
+                cb(rows);
             }
         );
     }
 
     /**
-     * Fills the Power Mode panel from power-profiles-daemon.
+     * Builds the Power Mode panel's rows from power-profiles-daemon.
      *
-     * @param {object} list - Container to populate.
+     * @param {Function} cb - Receives row descriptors.
      * @private
      */
-    _populatePower(list) {
+    _fetchPower(cb) {
         this._runAll(["powerprofilesctl list"], ([out]) => {
-            if (list.is_finalized()) {
-                return;
-            }
-            list.destroy_all_children();
-
+            const rows = [];
             // Lines look like "  balanced:" or "* power-saver:" for the active
             // one; the indented driver lines below each are ignored.
-            const profiles = [];
             String(out).split("\n").forEach((line) => {
                 const m = line.match(/^(\*?)\s*([a-z-]+):\s*$/);
-                if (m) {
-                    profiles.push({ name: m[2], active: m[1] === "*" });
+                if (!m) {
+                    return;
                 }
-            });
-
-            if (!profiles.length) {
-                list.add_child(this._panelNote(_("No power profiles available")));
-                return;
-            }
-
-            profiles.forEach((profile) => {
-                list.add_child(
-                    this._panelRow(
-                        "power-profile-" + profile.name + "-symbolic",
-                        titleCase(profile.name),
-                        profile.active ? _("Active") : _("Select"),
-                        () => {
-                            if (profile.active) {
-                                return;
-                            }
-                            GLib.spawn_command_line_async(
-                                "powerprofilesctl set " + GLib.shell_quote(profile.name)
-                            );
-                            this.updateMenu();
+                const name = m[2];
+                const active = m[1] === "*";
+                rows.push({
+                    kind: "row",
+                    icon: "power-profile-" + name + "-symbolic",
+                    label: titleCase(name),
+                    action: active ? _("Active") : _("Select"),
+                    run: () => {
+                        if (active) {
+                            return;
                         }
-                    )
-                );
+                        GLib.spawn_command_line_async(
+                            "powerprofilesctl set " + GLib.shell_quote(name)
+                        );
+                        this._invalidatePanel("power");
+                    },
+                });
             });
+            if (!rows.length) {
+                rows.push({ kind: "note", text: _("No power profiles available") });
+            }
+            cb(rows);
         });
     }
 
     /**
-     * Fills the Fan Curve panel from fw-fanctrl.
+     * Builds the Fan Curve panel's rows from fw-fanctrl.
      *
-     * @param {object} list - Container to populate.
+     * @param {Function} cb - Receives row descriptors.
      * @private
      */
-    _populateFan(list) {
+    _fetchFan(cb) {
         this._runAll(
             ["fw-fanctrl print list", "fw-fanctrl print current"],
             ([listOut, currentOut]) => {
-                if (list.is_finalized()) {
-                    return;
-                }
-                list.destroy_all_children();
-
                 const strategies = String(listOut)
                     .split("\n")
                     .map((line) => line.match(/^\s*-\s*(\S+)\s*$/))
@@ -1211,49 +1330,45 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 const current = (String(currentOut).match(/Strategy in use:\s*'([^']+)'/) || [])[1] || "";
 
                 if (!strategies.length) {
-                    list.add_child(this._panelNote(_("fw-fanctrl not responding")));
+                    cb([{ kind: "note", text: _("fw-fanctrl not responding") }]);
                     return;
                 }
 
-                strategies.forEach((name) => {
-                    // medium/agile/very-agile share one curve and differ only in
-                    // how fast they react, so say which is which.
-                    const reaction = FAN_REACTION[name];
-                    list.add_child(
-                        this._panelRow(
-                            "weather-windy-symbolic",
-                            reaction ? name + "  (" + reaction + ")" : name,
-                            name === current ? _("Active") : _("Select"),
-                            () => {
+                cb(
+                    strategies.map((name) => {
+                        // medium/agile/very-agile share one curve and differ
+                        // only in how fast they react, so say which is which.
+                        const reaction = FAN_REACTION[name];
+                        return {
+                            kind: "row",
+                            icon: "weather-windy-symbolic",
+                            label: reaction ? name + "  (" + reaction + ")" : name,
+                            action: name === current ? _("Active") : _("Select"),
+                            run: () => {
                                 if (name === current) {
                                     return;
                                 }
                                 GLib.spawn_command_line_async(
                                     "fw-fanctrl use " + GLib.shell_quote(name)
                                 );
-                                this.updateMenu();
-                            }
-                        )
-                    );
-                });
+                                this._invalidatePanel("fan");
+                            },
+                        };
+                    })
+                );
             }
         );
     }
 
     /**
-     * Fills the Wi-Fi panel with nearby networks.
+     * Builds the Wi-Fi panel's rows from nmcli.
      *
-     * @param {object} list - Container to populate.
+     * @param {Function} cb - Receives row descriptors.
      * @private
      */
-    _populateWifi(list) {
+    _fetchWifi(cb) {
         // SSID goes last so a name containing a colon cannot break the split.
         Util.spawnCommandLineAsyncIO("nmcli -t -f IN-USE,SIGNAL,SSID dev wifi", (stdout) => {
-            if (list.is_finalized()) {
-                return;
-            }
-            list.destroy_all_children();
-
             const best = new Map();
             String(stdout).split("\n").forEach((line) => {
                 const parts = line.match(/^([^:]*):([^:]*):(.*)$/);
@@ -1281,88 +1396,82 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 .slice(0, 6);
 
             if (!networks.length) {
-                list.add_child(this._panelNote(_("No networks found")));
+                cb([{ kind: "note", text: _("No networks found") }]);
                 return;
             }
 
-            networks.forEach((net) => {
-                const quoted = GLib.shell_quote(net.ssid);
-                list.add_child(
-                    this._panelRow(
+            cb(
+                networks.map((net) => ({
+                    kind: "row",
+                    icon:
                         net.signal > 60
                             ? "network-wireless-signal-excellent-symbolic"
                             : "network-wireless-signal-weak-symbolic",
-                        net.ssid,
-                        net.inUse ? _("Disconnect") : _("Connect"),
-                        () => {
-                            GLib.spawn_command_line_async(
-                                net.inUse
-                                    ? "nmcli con down id " + quoted
-                                    : "nmcli dev wifi connect " + quoted
-                            );
-                            this.menu.close(true);
-                        }
-                    )
-                );
-            });
+                    label: net.ssid,
+                    action: net.inUse ? _("Disconnect") : _("Connect"),
+                    run: () => {
+                        const quoted = GLib.shell_quote(net.ssid);
+                        GLib.spawn_command_line_async(
+                            net.inUse
+                                ? "nmcli con down id " + quoted
+                                : "nmcli dev wifi connect " + quoted
+                        );
+                        this.menu.close(true);
+                    },
+                }))
+            );
         });
     }
 
     /**
-     * Fills the Bluetooth panel with paired devices.
+     * Builds the Bluetooth panel's rows from bluetoothctl.
      *
-     * @param {object} list - Container to populate.
+     * @param {Function} cb - Receives row descriptors.
      * @private
      */
-    _populateBluetooth(list) {
-        Util.spawnCommandLineAsyncIO("bluetoothctl devices Paired", (stdout) => {
-            if (list.is_finalized()) {
-                return;
-            }
-            const devices = String(stdout)
-                .split("\n")
-                .map((line) => line.match(/^Device\s+(\S+)\s+(.*)$/))
-                .filter(Boolean)
-                .map((m) => ({ mac: m[1], name: m[2].trim() }));
-
-            Util.spawnCommandLineAsyncIO("bluetoothctl devices Connected", (out) => {
-                if (list.is_finalized()) {
-                    return;
-                }
-                list.destroy_all_children();
+    _fetchBluetooth(cb) {
+        this._runAll(
+            ["bluetoothctl devices Paired", "bluetoothctl devices Connected"],
+            ([pairedOut, connectedOut]) => {
+                const devices = String(pairedOut)
+                    .split("\n")
+                    .map((line) => line.match(/^Device\s+(\S+)\s+(.*)$/))
+                    .filter(Boolean)
+                    .map((m) => ({ mac: m[1], name: m[2].trim() }));
 
                 if (!devices.length) {
-                    list.add_child(this._panelNote(_("No paired devices")));
+                    cb([{ kind: "note", text: _("No paired devices") }]);
                     return;
                 }
 
                 const connected = new Set(
-                    String(out)
+                    String(connectedOut)
                         .split("\n")
                         .map((line) => (line.match(/^Device\s+(\S+)/) || [])[1])
                         .filter(Boolean)
                 );
 
-                devices.forEach((device) => {
-                    const isOn = connected.has(device.mac);
-                    list.add_child(
-                        this._panelRow(
-                            "bluetooth-symbolic",
-                            device.name,
-                            isOn ? _("Disconnect") : _("Connect"),
-                            () => {
+                cb(
+                    devices.map((device) => {
+                        const isOn = connected.has(device.mac);
+                        return {
+                            kind: "row",
+                            icon: "bluetooth-symbolic",
+                            label: device.name,
+                            action: isOn ? _("Disconnect") : _("Connect"),
+                            run: () => {
                                 GLib.spawn_command_line_async(
                                     "bluetoothctl " +
                                         (isOn ? "disconnect " : "connect ") +
                                         device.mac
                                 );
                                 this.menu.close(true);
-                            }
-                        )
-                    );
-                });
-            });
-        });
+                            },
+                        };
+                    })
+                );
+            }
+        );
     }
 
     /**
@@ -1392,6 +1501,10 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 x_expand: true,
             });
             rowSpecs.forEach((spec) => {
+                if (spec.expand) {
+                    // Panels drop in directly beneath the row that owns them.
+                    this.panelSlots[spec.expand] = { host: grid, index: i / 2 + 1 };
+                }
                 const tile = new QuickTile(spec, this.accent, {
                     onExpand: (key) => this._toggleExpansion(key),
                     onLaunch: (command) => {
@@ -1403,10 +1516,6 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 row.add_child(tile.actor);
             });
             grid.add_child(row);
-
-            if (this.expandedKey && rowSpecs.some((s) => s.expand === this.expandedKey)) {
-                grid.add_child(this._buildExpansionPanel(this.expandedKey));
-            }
         }
         return grid;
     }
@@ -1428,10 +1537,7 @@ class QuickSettingsApplet extends Applet.IconApplet {
             "audio"
         );
         box.add_child(this.volumeRow.actor);
-
-        if (this.expandedKey === "audio") {
-            box.add_child(this._buildExpansionPanel("audio"));
-        }
+        this.panelSlots.audio = { host: box, index: 1 };
 
         this.panelRow = this._sliderRow("display-brightness-symbolic", (v) => setPanelBrightness(v));
         box.add_child(this.panelRow.actor);
@@ -1468,6 +1574,10 @@ class QuickSettingsApplet extends Applet.IconApplet {
         shell.actor.set_style("padding: 0px;");
         shell.addActor(root, { span: -1, expand: true });
         this.menu.addMenuItem(shell);
+
+        // Slots exist now, so put back whatever panel was open.
+        this.panelActor = null;
+        this._syncExpansion();
 
         this.updateStatus();
     }
@@ -1752,6 +1862,9 @@ class QuickSettingsApplet extends Applet.IconApplet {
     on_applet_clicked() {
         this.updateStatus();
         this.menu.toggle();
+        if (this.menu.isOpen) {
+            this._prefetchPanels();
+        }
     }
 
     /**
