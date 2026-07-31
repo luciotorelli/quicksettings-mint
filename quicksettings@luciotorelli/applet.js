@@ -32,7 +32,7 @@ const ACCENT_FALLBACK = "rgb(255,113,57)";
 // Panel reveal. The curve must not overshoot: it drives a height and a scale
 // that have to stay in lockstep, and EASE_OUT_BACK pushes both past their
 // target and back, which shows up as the panel springing.
-const PANEL_ANIM_MS = 260;
+const PANEL_ANIM_MS = 170;
 const PANEL_ANIM_MODE = Clutter.AnimationMode.EASE_OUT_QUAD;
 
 // Reaction times for the strategies that share one curve, so the fan panel can
@@ -536,6 +536,21 @@ class QuickSettingsApplet extends Applet.IconApplet {
         this.menu = new Applet.AppletPopupMenu(this, orientation);
         this.menuManager.addMenu(this.menu);
 
+        this.menu.connect("open-state-changed", (menu, open) => {
+            if (open) {
+                this._prefetchPanels();
+                return;
+            }
+            // Reopening should start collapsed rather than restoring whatever
+            // was last expanded. Destroyed outright rather than animated out -
+            // the popup is already hidden, so there is nothing to animate.
+            this.expandedKey = null;
+            if (this.panelActor && !this.panelActor.is_finalized()) {
+                this.panelActor.destroy();
+            }
+            this.panelActor = null;
+        });
+
         this._addMenuItems();
         this.updateStatus();
     }
@@ -803,7 +818,6 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 title: _("Night Light"),
                 onToggle: (state) =>
                     setBool("org.cinnamon.settings-daemon.plugins.color", "night-light-enabled", state),
-                onOpen: "cinnamon-settings nightlight",
             },
             {
                 key: "airplane",
@@ -889,13 +903,15 @@ class QuickSettingsApplet extends Applet.IconApplet {
      *
      * The fetches are staggered rather than fired together: five panels is a
      * dozen subprocesses, and launching them in one go stutters the very frame
-     * the popup is trying to draw.
+     * the popup is trying to draw. The gap is kept short so every panel is
+     * warm well inside the time it takes to aim at a chevron - a cold one has
+     * to shell out before it can open, which reads as lag.
      *
      * @private
      */
     _prefetchPanels() {
         ["power", "fan", "audio", "wifi", "bluetooth"].forEach((key, i) => {
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, 120 * i, () => {
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, 50 * i, () => {
                 if (this.menu.isOpen) {
                     this._fetchPanel(key, (rows) => {
                         this.panelCache[key] = rows;
@@ -1953,9 +1969,6 @@ class QuickSettingsApplet extends Applet.IconApplet {
     on_applet_clicked() {
         this.updateStatus();
         this.menu.toggle();
-        if (this.menu.isOpen) {
-            this._prefetchPanels();
-        }
     }
 
     /**
