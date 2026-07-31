@@ -842,10 +842,18 @@ class QuickSettingsApplet extends Applet.IconApplet {
      * @private
      */
     _syncExpansion() {
-        if (this.panelActor && !this.panelActor.is_finalized()) {
-            this.panelActor.destroy();
-        }
+        const previous = this.panelActor;
         this.panelActor = null;
+
+        if (previous && !previous.is_finalized()) {
+            if (this.expandedKey) {
+                // Switching panels: drop the old one at once. Two panels
+                // animating opposite ways at the same time reads as a glitch.
+                previous.destroy();
+            } else {
+                this._animateOut(previous);
+            }
+        }
 
         if (!this.expandedKey) {
             return;
@@ -904,44 +912,89 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
-     * Animates a freshly built panel into place.
+     * Grows a freshly built panel open.
      *
-     * Three properties at once, because opacity alone was barely perceptible:
-     * it fades up, rises 22px, and scales from 92% about its top edge so the
-     * growth reads as the panel pushing the rows below it apart.
-     * EASE_OUT_BACK overshoots very slightly at the end, which gives it a snap
-     * rather than a drift.
+     * The height is what actually has to move. Fading and sliding the panel
+     * left the popup itself snapping to its new size in a single frame, which
+     * is the jump that reads as a freeze - the panel was animating but its
+     * container was not. Tweening the height makes every ancestor re-allocate
+     * each frame, so the popup grows with it.
      *
-     * Scheduled on BEFORE_REDRAW rather than an idle callback: idle runs
-     * whenever the main loop happens to drain, so any work still queued
-     * delayed the start and read as a stall. This fires on the next frame.
+     * Clipping is on for the duration so the rows are revealed by the growing
+     * edge rather than squashed into whatever height the tween is at.
      *
-     * Height is deliberately not animated. The list can still be loading, so
-     * its natural height may only be the placeholder's, and tweening to that
-     * produces a jump when the real rows arrive.
+     * The target is measured before the height is pinned, because set_height()
+     * sets the natural height too - measure after and you just read back the
+     * zero. Measuring an unparented actor is slightly approximate, so the
+     * height is released to -1 on completion, which corrects any few-pixel
+     * error and lets a later refresh resize the panel normally.
      *
      * @param {object} panel - The panel actor.
      * @private
      */
     _animateIn(panel) {
+        const natural = panel.get_preferred_height(-1)[1];
+
         panel.opacity = 0;
-        panel.translation_y = -22;
-        panel.set_pivot_point(0.5, 0);
-        panel.scale_y = 0.92;
-        panel.scale_x = 0.98;
+        if (natural > 0) {
+            panel.set_clip_to_allocation(true);
+            panel.set_height(0);
+        } else {
+            // Could not measure; fall back to the slide so something happens.
+            panel.translation_y = -18;
+        }
 
         Meta.later_add(Meta.LaterType.BEFORE_REDRAW, () => {
-            if (!panel.is_finalized()) {
-                panel.ease({
-                    opacity: 255,
-                    translation_y: 0,
-                    scale_y: 1,
-                    scale_x: 1,
-                    duration: PANEL_ANIM_MS,
-                    mode: PANEL_ANIM_MODE,
-                });
+            if (panel.is_finalized()) {
+                return false;
             }
+            const props = {
+                opacity: 255,
+                duration: PANEL_ANIM_MS,
+                mode: PANEL_ANIM_MODE,
+                onComplete: () => {
+                    if (panel.is_finalized()) {
+                        return;
+                    }
+                    panel.set_height(-1);
+                    panel.set_clip_to_allocation(false);
+                },
+            };
+            if (natural > 0) {
+                props.height = natural;
+            } else {
+                props.translation_y = 0;
+            }
+            panel.ease(props);
             return false;
+        });
+    }
+
+    /**
+     * Shrinks a panel closed, then destroys it.
+     *
+     * Without this the close is the same single-frame jump the open used to
+     * be, just downwards.
+     *
+     * @param {object} panel - The panel actor.
+     * @private
+     */
+    _animateOut(panel) {
+        if (!panel || panel.is_finalized()) {
+            return;
+        }
+        panel.set_clip_to_allocation(true);
+        panel.set_height(panel.get_height()); // pin the current height first
+        panel.ease({
+            height: 0,
+            opacity: 0,
+            duration: Math.round(PANEL_ANIM_MS * 0.75),
+            mode: PANEL_ANIM_MODE,
+            onStopped: () => {
+                if (!panel.is_finalized()) {
+                    panel.destroy();
+                }
+            },
         });
     }
 
