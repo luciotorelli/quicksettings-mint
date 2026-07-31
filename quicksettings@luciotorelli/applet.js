@@ -83,11 +83,19 @@ class Monitor {
     }
 
     /**
-     * Updates the label in the UI to reflect the current brightness value.
+     * Updates the captions above each slider to reflect the current values.
+     * The monitor's own label carries just the name now that each slider
+     * states its own percentage.
      */
     updateLabel() {
         if (this.menuLabel) {
-            this.menuLabel.setLabel(`${this.name}  (${this.brightness}%)`);
+            this.menuLabel.setLabel(this.name);
+        }
+        if (this.brightnessLabel) {
+            this.brightnessLabel.set_text(`Brightness (${this.brightness}%)`);
+        }
+        if (this.contrastLabel) {
+            this.contrastLabel.set_text(`Contrast (${this.contrast}%)`);
         }
     }
 
@@ -95,9 +103,12 @@ class Monitor {
      * Updates the monitor's menu with the current brightness and contrast values.
      */
     updateMenu() {
-        this.updateLabel(); // Update label for brightness
+        this.updateLabel();
         if (this.menuSlider) {
             this.menuSlider.setValue(this.brightness / 100); // Set slider to current brightness value
+        }
+        if (this.contrastSlider) {
+            this.contrastSlider.setValue(this.contrast / 100); // Contrast tracked the same way
         }
     }
 
@@ -140,53 +151,99 @@ class Monitor {
     }
 
     /**
+     * Builds one labelled slider, sized to sit alongside another on one line.
+     *
+     * @param {string} title - The caption above the slider ("Brightness").
+     * @param {number} initial - Starting value, 0-100.
+     * @param {Function} onPreview - Called with the live value while dragging.
+     * @param {Function} onCommit - Called with the final value on drag-end.
+     * @returns {object} `{ actor, label, slider }` for the caller to place.
+     * @private
+     */
+    _buildSliderColumn(title, initial, onPreview, onCommit) {
+        const column = new St.BoxLayout({ vertical: true });
+        column.set_x_expand(true);
+
+        const label = new St.Label({ text: `${title} (${initial}%)` });
+        label.set_style("font-size: 0.9em; padding-left: 2px;");
+        column.add_child(label);
+
+        const slider = new PopupMenu.PopupSliderMenuItem(initial / 100);
+        // The stock .popup-slider-menu-item is min-width: 15em. Two of those on
+        // one line would force a ~30em popup, so halve it - the pair then fits
+        // in roughly the width the single stacked slider used to take.
+        slider._slider.set_style("min-width: 7em;");
+        // The slider is a menu item in its own right, so it arrives with the
+        // popup-menu-item padding already applied. Nested inside this row that
+        // padding is doubled up; drop it.
+        slider.actor.set_style("padding: 0px;");
+        slider.actor.set_x_expand(true);
+
+        slider.connect("value-changed", (s) => onPreview(Math.round(100 * s.value)));
+        slider.connect("drag-end", (s) => onCommit(Math.round(100 * s.value)));
+
+        column.add_child(slider.actor);
+        return { actor: column, label, slider };
+    }
+
+    /**
      * Adds the monitor's brightness and contrast controls to the applet's popup menu.
-     * 
+     *
+     * The two sliders share a single horizontal line - brightness on the left,
+     * contrast on the right - under a heading carrying the monitor's name.
+     *
      * @param {object} menu - The menu to which the monitor's controls will be added.
      */
     addToMenu(menu) {
-        // Label for the monitor
-        const menuLabel = new PopupMenu.PopupMenuItem(this.name, {
+        // Monitor name, on its own line above the pair.
+        this.menuLabel = new PopupMenu.PopupMenuItem(this.name, {
             reactive: false,
         });
-        this.menuLabel = menuLabel;
-        menu.addMenuItem(menuLabel);
+        menu.addMenuItem(this.menuLabel);
 
-        // Brightness Slider
-        const menuSlider = new PopupMenu.PopupSliderMenuItem(this.brightness / 100);
-        this.menuSlider = menuSlider;
-        menuSlider.connect("value-changed", (slider) => {
-            const brightness = Math.round(100 * slider.value);
-            this.brightness = brightness;
-            this.updateLabel(); // Update label to show new brightness value
-        });
+        const brightness = this._buildSliderColumn(
+            "Brightness",
+            this.brightness,
+            (value) => {
+                this.brightness = value;
+                this.updateLabel(); // Live readout while the handle is moving
+            },
+            (value) => this.setBrightness(value)
+        );
 
-        menuSlider.connect("drag-end", (slider) => {
-            const brightness = Math.round(100 * slider.value);
-            this.setBrightness(brightness); // Set new brightness after dragging ends
-        });
+        const contrast = this._buildSliderColumn(
+            "Contrast",
+            this.contrast,
+            (value) => {
+                this.contrast = value;
+                this.updateLabel();
+            },
+            (value) => this.setContrast(value)
+        );
 
-        menu.addMenuItem(menuSlider);
+        this.brightnessLabel = brightness.label;
+        this.menuSlider = brightness.slider;
+        this.contrastLabel = contrast.label;
+        this.contrastSlider = contrast.slider;
 
-        // Contrast Label and Slider
-        const contrastLabel = new PopupMenu.PopupMenuItem(this.name + " Contrast", {
+        // One row holding both columns side by side.
+        const row = new PopupMenu.PopupBaseMenuItem({
             reactive: false,
-        });
-        menu.addMenuItem(contrastLabel);
-
-        const contrastSlider = new PopupMenu.PopupSliderMenuItem(this.contrast / 100);
-        menu.addMenuItem(contrastSlider);
-
-        contrastSlider.connect("value-changed", (slider) => {
-            const contrast = Math.round(100 * slider.value);
-            this.contrast = contrast;
-            contrastLabel.setLabel(`${this.name} Contrast (${contrast}%)`); // Update label to show new contrast value
+            activate: false,
+            hover: false,
         });
 
-        contrastSlider.connect("drag-end", (slider) => {
-            const contrast = Math.round(100 * slider.value);
-            this.setContrast(contrast); // Set new contrast after dragging ends
-        });
+        const hbox = new St.BoxLayout({ vertical: false, style: "spacing: 16px;" });
+        hbox.set_x_expand(true);
+        hbox.add_child(brightness.actor);
+        hbox.add_child(contrast.actor);
+
+        // span: -1 gives the box the full width of the row rather than one
+        // column of the menu item's internal column layout.
+        row.addActor(hbox, { span: -1, expand: true });
+        menu.addMenuItem(row);
+
+        this.updateLabel();
     }
 }
 

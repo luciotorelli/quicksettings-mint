@@ -4,6 +4,6 @@
     "description": "Access quick settings for Wi-Fi, Bluetooth, and Battery",
     "icon": "preferences-system",
     "max-instances": 1,
-    "cinnamon-version": ["4.8", "4.6", "4.4"]
+    "cinnamon-version": ["6.6", "6.4", "6.2", "6.0", "4.8", "4.6", "4.4"]
 }
 
