@@ -786,6 +786,13 @@ class QuickSettingsApplet extends Applet.IconApplet {
     _tileSpecs() {
         return [
             {
+                key: "wired",
+                icon: "network-wired-symbolic",
+                title: _("Wired"),
+                expand: "wired",
+                onToggle: (state) => this._setWired(state),
+            },
+            {
                 key: "wifi",
                 icon: "network-wireless-symbolic",
                 title: _("Wi-Fi"),
@@ -910,7 +917,7 @@ class QuickSettingsApplet extends Applet.IconApplet {
      * @private
      */
     _prefetchPanels() {
-        ["power", "fan", "audio", "wifi", "bluetooth"].forEach((key, i) => {
+        ["wired", "wifi", "power", "fan", "audio", "bluetooth"].forEach((key, i) => {
             GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, 50 * i, () => {
                 if (this.menu.isOpen) {
                     this._fetchPanel(key, (rows) => {
@@ -1182,6 +1189,7 @@ class QuickSettingsApplet extends Applet.IconApplet {
      */
     _fetchPanel(key, cb) {
         const fetchers = {
+            wired: (c) => this._fetchWired(c),
             wifi: (c) => this._fetchWifi(c),
             bluetooth: (c) => this._fetchBluetooth(c),
             audio: (c) => this._fetchAudio(c),
@@ -1202,6 +1210,12 @@ class QuickSettingsApplet extends Applet.IconApplet {
      */
     _buildExpansionPanel(key) {
         const meta = {
+            wired: {
+                icon: "network-wired-symbolic",
+                title: _("Wired"),
+                link: _("Network Settings"),
+                command: "cinnamon-settings network",
+            },
             wifi: {
                 icon: "network-wireless-symbolic",
                 title: _("Wi-Fi"),
@@ -1468,6 +1482,54 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
+     * Builds the Wired panel's rows from nmcli.
+     *
+     * Driven by device rather than by connection: `nmcli device connect` works
+     * whatever the profile happens to be called, whereas `con up` needs the
+     * exact name and breaks the moment a profile is renamed.
+     *
+     * @param {Function} cb - Receives row descriptors.
+     * @private
+     */
+    _fetchWired(cb) {
+        this._runAll(
+            ["nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status"],
+            ([out]) => {
+                const rows = [];
+                String(out).split("\n").forEach((line) => {
+                    // CONNECTION is last, so a name containing a colon cannot
+                    // shift the fields before it.
+                    const m = line.match(/^([^:]*):([^:]*):([^:]*):(.*)$/);
+                    if (!m || m[2] !== "ethernet") {
+                        return;
+                    }
+                    const device = m[1];
+                    const up = m[3] === "connected";
+                    const name = m[4].trim();
+                    rows.push({
+                        kind: "row",
+                        icon: "network-wired-symbolic",
+                        label: name || device,
+                        action: up ? _("Disconnect") : _("Connect"),
+                        run: () => {
+                            GLib.spawn_command_line_async(
+                                "nmcli device " +
+                                    (up ? "disconnect " : "connect ") +
+                                    GLib.shell_quote(device)
+                            );
+                            this._invalidatePanel("wired");
+                        },
+                    });
+                });
+                if (!rows.length) {
+                    rows.push({ kind: "note", text: _("No wired adapter") });
+                }
+                cb(rows);
+            }
+        );
+    }
+
+    /**
      * Builds the Wi-Fi panel's rows from nmcli.
      *
      * @param {Function} cb - Receives row descriptors.
@@ -1622,6 +1684,13 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 this.tiles[spec.key] = tile;
                 row.add_child(tile.actor);
             });
+            if (rowSpecs.length === 1) {
+                // Odd count: without a filler the homogeneous layout would
+                // stretch the last pill across the full width.
+                const filler = new St.Widget();
+                filler.set_x_expand(true);
+                row.add_child(filler);
+            }
             grid.add_child(row);
         }
         return grid;
@@ -1719,6 +1788,27 @@ class QuickSettingsApplet extends Applet.IconApplet {
         this.detecting = false;
         if (!init) {
             this.updateMenu();
+        }
+    }
+
+    /**
+     * Brings the wired adapter up or down.
+     *
+     * @param {boolean} state - True to connect.
+     * @private
+     */
+    _setWired(state) {
+        if (!this.wiredDevice) {
+            return;
+        }
+        try {
+            GLib.spawn_command_line_async(
+                "nmcli device " +
+                    (state ? "connect " : "disconnect ") +
+                    GLib.shell_quote(this.wiredDevice)
+            );
+        } catch (e) {
+            global.logError("Error toggling wired in Quick Settings applet: " + e);
         }
     }
 
@@ -1898,6 +1988,37 @@ class QuickSettingsApplet extends Applet.IconApplet {
      */
     _refreshTiles() {
         const tile = (key) => this.tiles[key];
+
+        if (tile("wired")) {
+            Util.spawnCommandLineAsyncIO(
+                "nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status",
+                (out) => {
+                    if (!tile("wired")) {
+                        return;
+                    }
+                    let device = null;
+                    let name = "";
+                    let up = false;
+                    String(out).split("\n").forEach((line) => {
+                        const m = line.match(/^([^:]*):([^:]*):([^:]*):(.*)$/);
+                        if (!m || m[2] !== "ethernet") {
+                            return;
+                        }
+                        // Prefer a connected adapter if there is more than one.
+                        if (!device || m[3] === "connected") {
+                            device = m[1];
+                            up = m[3] === "connected";
+                            name = m[4].trim();
+                        }
+                    });
+                    this.wiredDevice = device;
+                    tile("wired").setActive(up);
+                    tile("wired").setSubtitle(
+                        up ? name : device ? _("Not connected") : _("No adapter")
+                    );
+                }
+            );
+        }
 
         if (tile("wifi")) {
             Util.spawnCommandLineAsyncIO("nmcli radio wifi", (stdout) => {
