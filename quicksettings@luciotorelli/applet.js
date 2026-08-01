@@ -793,18 +793,18 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 onToggle: (state) => this._setWired(state),
             },
             {
-                key: "wifi",
-                icon: "network-wireless-symbolic",
-                title: _("Wi-Fi"),
-                expand: "wifi",
-                onToggle: (state) => this._setWifi(state),
-            },
-            {
                 key: "bluetooth",
                 icon: "bluetooth-symbolic",
                 title: _("Bluetooth"),
                 expand: "bluetooth",
                 onToggle: (state) => this._setBluetooth(state),
+            },
+            {
+                key: "wifi",
+                icon: "network-wireless-symbolic",
+                title: _("Wi-Fi"),
+                expand: "wifi",
+                onToggle: (state) => this._setWifi(state),
             },
             // Multi-choice pills: no onToggle, so both halves open the panel.
             {
