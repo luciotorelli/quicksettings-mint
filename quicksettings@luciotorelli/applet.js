@@ -709,11 +709,7 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
         const row = new St.BoxLayout({ vertical: false, style: "spacing: 6px;" });
         row.set_x_expand(true);
 
-        const battery = new St.BoxLayout({ vertical: false });
-        battery.set_style(
-            "spacing: 6px; padding: 6px 14px; border-radius: 16px;" +
-            "background-color: " + TILE_IDLE + ";"
-        );
+        const battery = new St.BoxLayout({ vertical: false, style: "spacing: 6px;" });
         this.batteryIcon = new St.Icon({
             icon_name: "battery-good-symbolic",
             icon_type: St.IconType.SYMBOLIC,
@@ -729,7 +725,24 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
         // ellipsized to "..." rather than triggering a relayout.
         this.batteryLabel.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
         battery.add_child(this.batteryLabel);
-        row.add_child(battery);
+
+        // The readout doubles as the way into Power Management, so the pill
+        // becomes a button rather than a plain box. Styling moves onto the
+        // button so the hover wash covers the whole thing.
+        const batteryButton = new St.Button({ child: battery });
+        const paintBattery = (hovered) =>
+            batteryButton.set_style(
+                "padding: 6px 14px; border-radius: 16px; transition-duration: 150;" +
+                "background-color: " + (hovered ? TILE_HOVER : TILE_IDLE) + ";"
+            );
+        paintBattery(false);
+        batteryButton.connect("enter-event", () => paintBattery(true));
+        batteryButton.connect("leave-event", () => paintBattery(false));
+        batteryButton.connect("clicked", () => {
+            this.menu.close(true);
+            Util.spawnCommandLine("cinnamon-settings power");
+        });
+        row.add_child(batteryButton);
 
         const spacer = new St.Widget();
         spacer.set_x_expand(true);
