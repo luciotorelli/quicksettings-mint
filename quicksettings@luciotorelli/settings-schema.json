@@ -1,0 +1,259 @@
+{
+  "layout": {
+    "type": "layout",
+    "pages": ["pillsPage", "appearancePage", "slidersPage", "behaviourPage"],
+
+    "pillsPage": {
+      "type": "page",
+      "title": "Pills",
+      "sections": ["visibleSection", "interactionSection"]
+    },
+    "appearancePage": {
+      "type": "page",
+      "title": "Appearance",
+      "sections": ["sizeSection", "colourSection"]
+    },
+    "slidersPage": {
+      "type": "page",
+      "title": "Sliders & Panel",
+      "sections": ["sliderSection", "panelSection"]
+    },
+    "behaviourPage": {
+      "type": "page",
+      "title": "Behaviour",
+      "sections": ["animationSection", "loadingSection"]
+    },
+
+    "visibleSection": {
+      "type": "section",
+      "title": "Which pills to show",
+      "keys": [
+        "show-wired",
+        "show-bluetooth",
+        "show-wifi",
+        "show-power",
+        "show-fan",
+        "show-nightlight",
+        "show-awake",
+        "show-airplane"
+      ]
+    },
+    "interactionSection": {
+      "type": "section",
+      "title": "What clicking does",
+      "keys": ["body-toggles"]
+    },
+
+    "sizeSection": {
+      "type": "section",
+      "title": "Size and shape",
+      "keys": ["pill-padding", "pill-radius", "pill-icon-size", "pill-spacing"]
+    },
+    "colourSection": {
+      "type": "section",
+      "title": "Colour",
+      "keys": ["use-theme-accent", "custom-accent", "text-contrast"]
+    },
+
+    "sliderSection": {
+      "type": "section",
+      "title": "Sliders in the popup",
+      "keys": ["show-volume", "show-panel-brightness", "show-monitor-sliders"]
+    },
+    "panelSection": {
+      "type": "section",
+      "title": "The button in the panel",
+      "keys": ["panel-show-battery-icon", "panel-show-percentage"]
+    },
+
+    "animationSection": {
+      "type": "section",
+      "title": "Opening a panel",
+      "keys": ["animate-panels", "animation-duration"]
+    },
+    "loadingSection": {
+      "type": "section",
+      "title": "Loading",
+      "keys": ["prefetch-panels"]
+    }
+  },
+
+  "show-wired": {
+    "type": "switch",
+    "default": true,
+    "description": "Wired",
+    "tooltip": "Ethernet connection, with a panel listing every wired adapter"
+  },
+  "show-bluetooth": {
+    "type": "switch",
+    "default": true,
+    "description": "Bluetooth",
+    "tooltip": "Bluetooth radio, with a panel listing paired devices"
+  },
+  "show-wifi": {
+    "type": "switch",
+    "default": true,
+    "description": "Wi-Fi",
+    "tooltip": "Wi-Fi radio, with a panel listing nearby networks"
+  },
+  "show-power": {
+    "type": "switch",
+    "default": true,
+    "description": "Power Mode",
+    "tooltip": "Power profile, via power-profiles-daemon. Reads as on while Performance is selected"
+  },
+  "show-fan": {
+    "type": "switch",
+    "default": true,
+    "description": "Fan Curve",
+    "tooltip": "Fan strategy, via fw-fanctrl. Only useful on a Framework laptop with fw-fanctrl installed"
+  },
+  "show-nightlight": {
+    "type": "switch",
+    "default": true,
+    "description": "Night Light",
+    "tooltip": "Warms the screen colour temperature"
+  },
+  "show-awake": {
+    "type": "switch",
+    "default": true,
+    "description": "Keep Awake",
+    "tooltip": "Holds a systemd inhibitor and clears the screen timeouts, restoring them when switched off"
+  },
+  "show-airplane": {
+    "type": "switch",
+    "default": true,
+    "description": "Airplane Mode",
+    "tooltip": "Switches every radio off"
+  },
+
+  "body-toggles": {
+    "type": "switch",
+    "default": true,
+    "description": "Clicking a pill toggles it, the arrow opens its panel",
+    "tooltip": "This is how GNOME's Quick Settings behave. Turn it off to swap the two halves round, so clicking the pill opens its panel and the arrow does the toggling"
+  },
+
+  "pill-padding": {
+    "type": "spinbutton",
+    "default": 9,
+    "min": 4,
+    "max": 22,
+    "step": 1,
+    "units": "pixels",
+    "description": "Pill height",
+    "tooltip": "Padding above and below the pill contents. Larger values make the whole grid taller"
+  },
+  "pill-radius": {
+    "type": "spinbutton",
+    "default": 22,
+    "min": 0,
+    "max": 30,
+    "step": 1,
+    "units": "pixels",
+    "description": "Corner rounding",
+    "tooltip": "0 gives square corners; anything at or above half the pill height gives a full capsule"
+  },
+  "pill-icon-size": {
+    "type": "spinbutton",
+    "default": 18,
+    "min": 12,
+    "max": 32,
+    "step": 1,
+    "units": "pixels",
+    "description": "Icon size",
+    "tooltip": "Size of the symbolic icon inside each pill"
+  },
+  "pill-spacing": {
+    "type": "spinbutton",
+    "default": 8,
+    "min": 0,
+    "max": 20,
+    "step": 1,
+    "units": "pixels",
+    "description": "Gap between pills",
+    "tooltip": "Applies both across a row and between rows"
+  },
+
+  "use-theme-accent": {
+    "type": "switch",
+    "default": true,
+    "description": "Take the accent colour from the desktop theme",
+    "tooltip": "Reads whatever the current theme paints a slider with, so the applet follows Mint-Y-Blue, -Orange, -Teal and the rest automatically"
+  },
+  "custom-accent": {
+    "type": "colorchooser",
+    "default": "rgb(255,113,57)",
+    "description": "Accent colour",
+    "dependency": "!use-theme-accent",
+    "tooltip": "Used for active pills, slider fills and panel badges"
+  },
+  "text-contrast": {
+    "type": "combobox",
+    "default": "auto",
+    "description": "Text on an active pill",
+    "options": {
+      "Choose automatically": "auto",
+      "Always dark": "dark",
+      "Always light": "light"
+    },
+    "tooltip": "Automatic picks dark or light from how bright the accent is, which keeps text readable on both a light orange and a dark blue"
+  },
+
+  "show-volume": {
+    "type": "switch",
+    "default": true,
+    "description": "Volume",
+    "tooltip": "Volume slider, with an arrow opening the output and input device list"
+  },
+  "show-panel-brightness": {
+    "type": "switch",
+    "default": true,
+    "description": "Screen brightness",
+    "tooltip": "Laptop panel backlight. Has no effect on a desktop with no internal display"
+  },
+  "show-monitor-sliders": {
+    "type": "switch",
+    "default": true,
+    "description": "External monitor brightness and contrast",
+    "tooltip": "Needs ddcutil installed and a monitor that speaks DDC/CI. Laptop panels do not"
+  },
+
+  "panel-show-battery-icon": {
+    "type": "switch",
+    "default": true,
+    "description": "Show the battery icon",
+    "tooltip": "Turn off to fall back to a settings cog. Machines with no battery always show the cog"
+  },
+  "panel-show-percentage": {
+    "type": "switch",
+    "default": true,
+    "description": "Show the battery percentage",
+    "tooltip": "The number beside the icon in the panel"
+  },
+
+  "animate-panels": {
+    "type": "switch",
+    "default": true,
+    "description": "Animate panels opening and closing",
+    "tooltip": "Turn off to have panels appear immediately"
+  },
+  "animation-duration": {
+    "type": "spinbutton",
+    "default": 170,
+    "min": 0,
+    "max": 600,
+    "step": 10,
+    "units": "milliseconds",
+    "description": "Animation length",
+    "dependency": "animate-panels",
+    "tooltip": "How long a panel takes to unfold. Around 150 to 250 feels responsive; higher starts to feel sluggish"
+  },
+
+  "prefetch-panels": {
+    "type": "switch",
+    "default": true,
+    "description": "Load panel contents as the popup opens",
+    "tooltip": "Panel contents come from commands like nmcli and pactl, which take a moment. Reading them up front means a panel opens at its full size straight away instead of filling in. Turn off to only read them when a panel is actually opened"
+  }
+}

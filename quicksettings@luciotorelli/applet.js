@@ -9,30 +9,23 @@ const GLib = imports.gi.GLib;
 const Gio = imports.gi.Gio;
 const Pango = imports.gi.Pango;
 const Meta = imports.gi.Meta;
+const Settings = imports.ui.settings;
 
 const DEFAULT_TOOLTIP = "Quick Settings";
 const BRIGHTNESS_ADJUSTMENT_STEP = 5;
 
-// GNOME's Quick Settings model: the tile body toggles, and the chevron on the
-// right opens the matching settings app. Note this is the INVERSE of the
-// earlier gear-icon behaviour - it is what the two-part pill shape implies,
-// and a pill with no toggle affordance anywhere would be worse. Flip this to
-// false to swap the two halves back.
-const BODY_TOGGLES = true;
-
 // Tile geometry, shared by the quick toggles so they line up.
 const TILE_RADIUS = 14;
-const TILE_PILL_RADIUS = 22;
 const TILE_IDLE = "rgba(255,255,255,0.07)";
 const TILE_HOVER = "rgba(255,255,255,0.13)";
 
 // Only used if the theme lookup below fails; matches Mint-Y-Dark-Orange.
 const ACCENT_FALLBACK = "rgb(255,113,57)";
 
-// Panel reveal. The curve must not overshoot: it drives a height and a scale
-// that have to stay in lockstep, and EASE_OUT_BACK pushes both past their
-// target and back, which shows up as the panel springing.
-const PANEL_ANIM_MS = 170;
+// Panel reveal curve. Must not overshoot: it drives a height and a scale that
+// have to stay in lockstep, and EASE_OUT_BACK pushes both past their target
+// and back, which shows up as the panel springing. The duration and whether
+// it animates at all are settings.
 const PANEL_ANIM_MODE = Clutter.AnimationMode.EASE_OUT_QUAD;
 
 // Keep Awake. The systemd lock is real but only covers logind's own idle and
@@ -112,13 +105,24 @@ const FAN_REACTION = { medium: "5s", agile: "3s", "very-agile": "2s" };
  * @returns {string} A CSS colour.
  */
 function contrastOn(css) {
-    const parts = String(css).match(/(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
-    if (!parts) {
+    const text = String(css);
+    let r;
+    let g;
+    let b;
+    const rgb = text.match(/(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+    const hex = text.match(/^#([0-9a-fA-F]{6})$/);
+    if (rgb) {
+        r = parseInt(rgb[1], 10);
+        g = parseInt(rgb[2], 10);
+        b = parseInt(rgb[3], 10);
+    } else if (hex) {
+        // The colour chooser can hand back either form.
+        r = parseInt(hex[1].slice(0, 2), 16);
+        g = parseInt(hex[1].slice(2, 4), 16);
+        b = parseInt(hex[1].slice(4, 6), 16);
+    } else {
         return "#ffffff";
     }
-    const r = parseInt(parts[1], 10);
-    const g = parseInt(parts[2], 10);
-    const b = parseInt(parts[3], 10);
     // Rec. 601 luma. The 0.5 threshold puts Mint-Y's orange (0.58) on the dark
     // side and its blue (0.47) on the light side, which is where they belong.
     const luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
@@ -413,11 +417,11 @@ class QuickTile {
      * @param {string} accent - Theme accent used for the active state.
      * @param {object} handlers - `{ onExpand, onLaunch }` callbacks.
      */
-    constructor(spec, accent, handlers) {
+    constructor(spec, style, handlers) {
         this.spec = spec;
-        this.accent = accent;
-        // Derived once so _paint() does not recompute it on every hover.
-        this.foreground = contrastOn(accent);
+        this.accent = style.accent;
+        this.style = style;
+        this.foreground = style.foreground;
         this.darkForeground = this.foreground.indexOf("rgba(0,") === 0;
         this.active = false;
         this.hovered = false;
@@ -429,7 +433,7 @@ class QuickTile {
         this.icon = new St.Icon({
             icon_name: spec.icon,
             icon_type: St.IconType.SYMBOLIC,
-            icon_size: 18,
+            icon_size: style.iconSize,
         });
         inner.add_child(this.icon);
 
@@ -453,6 +457,7 @@ class QuickTile {
               }
             : null;
         // The chevron either expands an inline panel or launches an app.
+        const bodyToggles = style.bodyToggles;
         const chevronAction = spec.expand
             ? () => handlers.onExpand(spec.expand)
             : spec.onOpen
@@ -467,7 +472,7 @@ class QuickTile {
         this.body.x_fill = true;
         this.body.x_align = St.Align.START;
         const bodyAction =
-            (BODY_TOGGLES || !chevronAction ? toggleAction : chevronAction) ||
+            (bodyToggles || !chevronAction ? toggleAction : chevronAction) ||
             chevronAction;
         if (bodyAction) {
             this.body.connect("clicked", bodyAction);
@@ -484,7 +489,7 @@ class QuickTile {
             });
             this.chevron.connect(
                 "clicked",
-                (BODY_TOGGLES ? chevronAction : toggleAction) || chevronAction
+                (bodyToggles ? chevronAction : toggleAction) || chevronAction
             );
             this.actor.add_child(this.chevron);
         }
@@ -515,15 +520,17 @@ class QuickTile {
 
         // No padding on the tile itself - each segment pads its own content, so
         // the chevron's background reaches the pill edge.
+        const radius = this.style.radius;
+        const pad = this.style.padding;
         this.actor.set_style(
             "padding: 0px; transition-duration: 150;" +
-            "border-radius: " + TILE_PILL_RADIUS + "px;" +
+            "border-radius: " + radius + "px;" +
             "background-color: " + background + ";"
         );
         this.body.set_style(
             "background-color: transparent; border: none;" +
-            "padding: 9px 14px;" +
-            "border-radius: " + TILE_PILL_RADIUS + "px 0px 0px " + TILE_PILL_RADIUS + "px;"
+            "padding: " + pad + "px 14px;" +
+            "border-radius: " + radius + "px 0px 0px " + radius + "px;"
         );
 
         if (this.active) {
@@ -551,10 +558,10 @@ class QuickTile {
                 ? "rgba(0,0,0,0.28)"
                 : "rgba(255,255,255,0.30)";
             this.chevron.set_style(
-                "padding: 9px 13px;" +
+                "padding: " + pad + "px 13px;" +
                 "background-color: " + segment + ";" +
                 "border-left: 1px solid " + divider + ";" +
-                "border-radius: 0px " + TILE_PILL_RADIUS + "px " + TILE_PILL_RADIUS + "px 0px;" +
+                "border-radius: 0px " + radius + "px " + radius + "px 0px;" +
                 (this.active ? "color: " + this.foreground + ";" : "")
             );
         }
@@ -626,6 +633,22 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
         this.panelSlots = {};   // key -> { host, index } for insertion
         this.panelActor = null;
 
+        this.settings = new Settings.AppletSettings(this, metadata.uuid, instance_id);
+        // Bound as key -> this.key_with_underscores, so the schema stays the
+        // single place a setting is described.
+        [
+            "show-wired", "show-bluetooth", "show-wifi", "show-power", "show-fan",
+            "show-nightlight", "show-awake", "show-airplane",
+            "body-toggles",
+            "pill-padding", "pill-radius", "pill-icon-size", "pill-spacing",
+            "use-theme-accent", "custom-accent", "text-contrast",
+            "show-volume", "show-panel-brightness", "show-monitor-sliders",
+            "panel-show-battery-icon", "panel-show-percentage",
+            "animate-panels", "animation-duration", "prefetch-panels",
+        ].forEach((key) => {
+            this.settings.bind(key, key.replace(/-/g, "_"), () => this._onSettingsChanged());
+        });
+
         this.menuManager = new PopupMenu.PopupMenuManager(this);
         this.menu = new Applet.AppletPopupMenu(this, orientation);
         this.menuManager.addMenu(this.menu);
@@ -661,8 +684,46 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
      *
      * @private
      */
+    /**
+     * Rebuilds everything a setting could have changed.
+     *
+     * @private
+     */
+    _onSettingsChanged() {
+        this.accent = this._resolveAccent();
+        this.foreground = this._resolveForeground();
+        this.updateMenu();
+        this._refreshBattery();
+    }
+
+    /**
+     * @returns {string} The accent, from the theme or the chosen colour.
+     * @private
+     */
+    _resolveAccent() {
+        if (this.use_theme_accent === false) {
+            return this.custom_accent || ACCENT_FALLBACK;
+        }
+        return themeAccent();
+    }
+
+    /**
+     * @returns {string} Foreground for a filled pill.
+     * @private
+     */
+    _resolveForeground() {
+        if (this.text_contrast === "dark") {
+            return "rgba(0,0,0,0.85)";
+        }
+        if (this.text_contrast === "light") {
+            return "#ffffff";
+        }
+        return contrastOn(this.accent);
+    }
+
     _addMenuItems() {
-        this.accent = themeAccent();
+        this.accent = this._resolveAccent();
+        this.foreground = this._resolveForeground();
         this.updateMenu();
         this.updateMonitors();
     }
@@ -898,6 +959,17 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
      * @private
      */
     _tileSpecs() {
+        // this["show_" + key] comes from the matching show-<key> schema entry.
+        return this._allTileSpecs().filter((spec) => this["show_" + spec.key] !== false);
+    }
+
+    /**
+     * Every pill the applet knows how to build, before the visibility filter.
+     *
+     * @returns {Array<object>} Tile specs.
+     * @private
+     */
+    _allTileSpecs() {
         return [
             {
                 key: "wired",
@@ -1037,6 +1109,9 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
      * @private
      */
     _prefetchPanels() {
+        if (this.prefetch_panels === false) {
+            return;
+        }
         ["wired", "wifi", "power", "fan", "audio", "bluetooth"].forEach((key, i) => {
             GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, 50 * i, () => {
                 if (this.menu.isOpen) {
@@ -1091,6 +1166,10 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
      * @private
      */
     _animateIn(panel, forWidth) {
+        if (this.animate_panels === false || this.animation_duration === 0) {
+            return; // appear immediately
+        }
+        const duration = this.animation_duration;
         // Measure at the width the panel will actually be given. An unparented
         // actor measured at -1 reported 260px for a panel that is really 626px,
         // so the tween finished at 40% and then snapped the rest of the way -
@@ -1105,7 +1184,7 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
                 if (!panel.is_finalized()) {
                     panel.ease({
                         opacity: 255,
-                        duration: PANEL_ANIM_MS,
+                        duration: duration,
                         mode: PANEL_ANIM_MODE,
                     });
                 }
@@ -1126,7 +1205,7 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
             panel.ease({
                 height: natural,
                 opacity: 255,
-                duration: PANEL_ANIM_MS,
+                duration: duration,
                 mode: PANEL_ANIM_MODE,
                 onComplete: () => {
                     if (panel.is_finalized()) {
@@ -1138,7 +1217,7 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
             });
             content.ease({
                 scale_y: 1,
-                duration: PANEL_ANIM_MS,
+                duration: duration,
                 mode: PANEL_ANIM_MODE,
             });
             return false;
@@ -1158,7 +1237,11 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
         if (!panel || panel.is_finalized()) {
             return;
         }
-        const duration = Math.round(PANEL_ANIM_MS * 0.75);
+        if (this.animate_panels === false || this.animation_duration === 0) {
+            panel.destroy();
+            return;
+        }
+        const duration = Math.round(this.animation_duration * 0.75);
         const content = panel._content;
 
         panel.set_clip_to_allocation(true);
@@ -1772,8 +1855,18 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
      */
     _buildTileGrid() {
         const specs = this._tileSpecs();
-        const grid = new St.BoxLayout({ vertical: true, style: "spacing: 8px;" });
+        const gap = this.pill_spacing;
+        const grid = new St.BoxLayout({ vertical: true, style: "spacing: " + gap + "px;" });
         grid.set_x_expand(true);
+
+        const tileStyle = {
+            accent: this.accent,
+            foreground: this.foreground,
+            radius: this.pill_radius,
+            padding: this.pill_padding,
+            iconSize: this.pill_icon_size,
+            bodyToggles: this.body_toggles !== false,
+        };
 
         for (let i = 0; i < specs.length; i += 2) {
             const rowSpecs = specs.slice(i, i + 2);
@@ -1785,7 +1878,7 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
                 layout_manager: new Clutter.BoxLayout({
                     orientation: Clutter.Orientation.HORIZONTAL,
                     homogeneous: true,
-                    spacing: 8,
+                    spacing: gap,
                 }),
                 x_expand: true,
             });
@@ -1794,7 +1887,7 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
                     // Panels drop in directly beneath the row that owns them.
                     this.panelSlots[spec.expand] = { host: grid, index: i / 2 + 1 };
                 }
-                const tile = new QuickTile(spec, this.accent, {
+                const tile = new QuickTile(spec, tileStyle, {
                     onExpand: (key) => this._toggleExpansion(key),
                     onLaunch: (command) => {
                         this.menu.close(true);
@@ -1827,18 +1920,28 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
         const box = new St.BoxLayout({ vertical: true, style: "spacing: 4px;" });
         box.set_x_expand(true);
 
-        this.volumeRow = this._sliderRow(
-            "audio-volume-high-symbolic",
-            (v) => this._setVolume(v),
-            "audio"
-        );
-        box.add_child(this.volumeRow.actor);
-        this.panelSlots.audio = { host: box, index: 1 };
+        this.volumeRow = null;
+        this.panelRow = null;
 
-        this.panelRow = this._sliderRow("display-brightness-symbolic", (v) => setPanelBrightness(v));
-        box.add_child(this.panelRow.actor);
+        if (this.show_volume !== false) {
+            this.volumeRow = this._sliderRow(
+                "audio-volume-high-symbolic",
+                (v) => this._setVolume(v),
+                "audio"
+            );
+            box.add_child(this.volumeRow.actor);
+            // Index tracks the volume row, so the Sound panel opens under it.
+            this.panelSlots.audio = { host: box, index: 1 };
+        }
 
-        this.monitors.forEach((monitor) => box.add_child(this._monitorRow(monitor)));
+        if (this.show_panel_brightness !== false) {
+            this.panelRow = this._sliderRow("display-brightness-symbolic", (v) => setPanelBrightness(v));
+            box.add_child(this.panelRow.actor);
+        }
+
+        if (this.show_monitor_sliders !== false) {
+            this.monitors.forEach((monitor) => box.add_child(this._monitorRow(monitor)));
+        }
 
         return box;
     }
@@ -2127,8 +2230,11 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
 
             // Panel readout: battery icon plus percentage, in place of the
             // static settings cog.
-            this.set_applet_label(capacity + "%");
-            const iconName = batteryIconName(parseInt(capacity, 10) || 0, status);
+            this.set_applet_label(this.panel_show_percentage === false ? "" : capacity + "%");
+            const iconName =
+                this.panel_show_battery_icon === false
+                    ? "preferences-system"
+                    : batteryIconName(parseInt(capacity, 10) || 0, status);
             if (iconName !== this.panelIconName) {
                 this.panelIconName = iconName;
                 this.set_applet_icon_symbolic_name(iconName);
