@@ -35,6 +35,68 @@ const ACCENT_FALLBACK = "rgb(255,113,57)";
 const PANEL_ANIM_MS = 170;
 const PANEL_ANIM_MODE = Clutter.AnimationMode.EASE_OUT_QUAD;
 
+// Keep Awake. The systemd lock is real but only covers logind's own idle and
+// sleep handling - csd-power blanks the display off its own idle monitor and
+// never consults it, so the gsettings timeouts have to be zeroed as well.
+// Whatever they were is stashed first, and put back when the pill goes off.
+const KEEP_AWAKE_WHO = "quicksettings-keep-awake";
+const TIMEOUT_KEYS = [
+    { schema: "org.cinnamon.settings-daemon.plugins.power", key: "sleep-display-ac", type: "i" },
+    { schema: "org.cinnamon.settings-daemon.plugins.power", key: "sleep-display-battery", type: "i" },
+    { schema: "org.cinnamon.desktop.session", key: "idle-delay", type: "u" },
+];
+
+/**
+ * Reads one of the timeout keys, honouring its type.
+ *
+ * @param {object} spec - Entry from TIMEOUT_KEYS.
+ * @returns {number|null} Seconds, or null if unreadable.
+ */
+function readTimeout(spec) {
+    try {
+        const settings = new Gio.Settings({ schema_id: spec.schema });
+        return spec.type === "u" ? settings.get_uint(spec.key) : settings.get_int(spec.key);
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Writes one of the timeout keys, honouring its type.
+ *
+ * @param {object} spec - Entry from TIMEOUT_KEYS.
+ * @param {number} value - Seconds; 0 means never.
+ */
+function writeTimeout(spec, value) {
+    try {
+        const settings = new Gio.Settings({ schema_id: spec.schema });
+        if (spec.type === "u") {
+            settings.set_uint(spec.key, value);
+        } else {
+            settings.set_int(spec.key, value);
+        }
+    } catch (e) {
+        global.logError("Quick Settings: could not write " + spec.key + ": " + e);
+    }
+}
+
+/**
+ * "10800" -> "3h", "900" -> "15m".
+ *
+ * @param {number} seconds - Duration.
+ * @returns {string} Short human form.
+ */
+function shortDuration(seconds) {
+    if (!seconds) {
+        return "never";
+    }
+    if (seconds >= 3600) {
+        const hours = seconds / 3600;
+        return (Math.round(hours * 10) / 10) + "h";
+    }
+    return Math.round(seconds / 60) + "m";
+}
+
 // Reaction times for the strategies that share one curve, so the fan panel can
 // say what actually differs between them.
 const FAN_REACTION = { medium: "5s", agile: "3s", "very-agile": "2s" };
@@ -831,6 +893,12 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 title: _("Night Light"),
                 onToggle: (state) =>
                     setBool("org.cinnamon.settings-daemon.plugins.color", "night-light-enabled", state),
+            },
+            {
+                key: "awake",
+                icon: "preferences-desktop-screensaver-symbolic",
+                title: _("Keep Awake"),
+                onToggle: (state) => this._setKeepAwake(state),
             },
             {
                 key: "airplane",
@@ -1819,6 +1887,80 @@ class QuickSettingsApplet extends Applet.IconApplet {
     }
 
     /**
+     * Where the pre-Keep-Awake timeouts are stashed.
+     *
+     * Kept outside the applet directory, which is a git checkout.
+     *
+     * @returns {string} Absolute path.
+     * @private
+     */
+    _timeoutBackupPath() {
+        return GLib.build_filenamev([
+            GLib.get_user_config_dir(),
+            "quicksettings-mint",
+            "timeouts.json",
+        ]);
+    }
+
+    /**
+     * Holds the screen awake, or hands it back to the saved timeouts.
+     *
+     * Two mechanisms, because one is not enough. systemd-inhibit takes a real
+     * logind lock, which is what covers idle and sleep at that level. But
+     * csd-power blanks the display from its own idle monitor and never asks
+     * logind, so the gsettings timeouts are zeroed too - and stashed first, so
+     * "what I set" comes back untouched.
+     *
+     * @param {boolean} on - True to keep the screen awake.
+     * @private
+     */
+    _setKeepAwake(on) {
+        try {
+            if (on) {
+                const saved = {};
+                TIMEOUT_KEYS.forEach((spec) => {
+                    const value = readTimeout(spec);
+                    if (value !== null) {
+                        saved[spec.schema + "/" + spec.key] = value;
+                    }
+                });
+                // Write the stash before zeroing anything, so a crash in
+                // between cannot lose the originals.
+                const path = this._timeoutBackupPath();
+                GLib.mkdir_with_parents(GLib.path_get_dirname(path), 0o755);
+                GLib.file_set_contents(path, JSON.stringify(saved));
+
+                TIMEOUT_KEYS.forEach((spec) => writeTimeout(spec, 0));
+                // No spaces in the arguments: this is parsed by
+                // shell_parse_argv, not run through a shell.
+                GLib.spawn_command_line_async(
+                    "systemd-inhibit --what=idle:sleep --who=" + KEEP_AWAKE_WHO +
+                    " --why=KeepAwake --mode=block sleep infinity"
+                );
+            } else {
+                GLib.spawn_command_line_async("pkill -f " + KEEP_AWAKE_WHO);
+                let saved = {};
+                try {
+                    const [ok, bytes] = GLib.file_get_contents(this._timeoutBackupPath());
+                    if (ok) {
+                        saved = JSON.parse(new TextDecoder().decode(bytes));
+                    }
+                } catch (e) {
+                    saved = {};
+                }
+                TIMEOUT_KEYS.forEach((spec) => {
+                    const value = saved[spec.schema + "/" + spec.key];
+                    if (typeof value === "number") {
+                        writeTimeout(spec, value);
+                    }
+                });
+            }
+        } catch (e) {
+            global.logError("Error toggling Keep Awake in Quick Settings applet: " + e);
+        }
+    }
+
+    /**
      * Turns Wi-Fi on or off.
      *
      * Async on purpose: spawn_command_line_sync blocks the compositor for as
@@ -1994,6 +2136,31 @@ class QuickSettingsApplet extends Applet.IconApplet {
      */
     _refreshTiles() {
         const tile = (key) => this.tiles[key];
+
+        if (tile("awake")) {
+            // Asks logind what locks exist rather than scanning process
+            // lists, and deliberately does not name the marker in the command.
+            // spawnCommandLineAsyncIO runs everything as bash -c "<command>",
+            // so a `pgrep -f <marker>` matches its own bash wrapper and always
+            // reports the lock as held. Reading the marker out of the OUTPUT
+            // has no such problem. Querying logind also means the pill reads
+            // correctly after an applet reload, with no local flag to lose.
+            Util.spawnCommandLineAsyncIO("systemd-inhibit --list", (out) => {
+                if (!tile("awake")) {
+                    return;
+                }
+                const held = String(out).indexOf(KEEP_AWAKE_WHO) >= 0;
+                tile("awake").setActive(held);
+                if (held) {
+                    tile("awake").setSubtitle(_("No timeout"));
+                } else {
+                    const ac = readTimeout(TIMEOUT_KEYS[0]);
+                    tile("awake").setSubtitle(
+                        ac === null ? "" : _("Screen off") + " " + shortDuration(ac)
+                    );
+                }
+            });
+        }
 
         if (tile("wired")) {
             Util.spawnCommandLineAsyncIO(
