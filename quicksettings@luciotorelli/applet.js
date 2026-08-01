@@ -2392,6 +2392,22 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
                     tile("bluetooth").setActive(String(stdout).includes("Powered: yes"));
                 }
             });
+            // The connected device belongs on the pill, the same way the SSID
+            // sits under Wi-Fi. Without this the pill said only "Bluetooth"
+            // and you had to open the panel to see what was attached.
+            Util.spawnCommandLineAsyncIO("bluetoothctl devices Connected", (out) => {
+                if (!tile("bluetooth")) {
+                    return;
+                }
+                const names = String(out)
+                    .split("\n")
+                    .map((line) => (line.match(/^Device\s+\S+\s+(.*)$/) || [])[1])
+                    .filter(Boolean)
+                    .map((name) => name.trim());
+                tile("bluetooth").setSubtitle(
+                    names.length > 1 ? names.length + " " + _("devices") : names[0] || ""
+                );
+            });
         }
 
         if (tile("power")) {
