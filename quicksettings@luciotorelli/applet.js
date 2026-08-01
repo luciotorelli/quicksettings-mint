@@ -376,6 +376,12 @@ class QuickTile {
             : null;
 
         this.body = new St.Button({ child: inner, x_expand: true });
+        // St.Bin centres its child by default, so each pill's icon sat at a
+        // different offset depending on how wide its label happened to be -
+        // 28px into Wired but 90px into Night Light. Filling the button makes
+        // every icon start at the same place, so they line up as a column.
+        this.body.x_fill = true;
+        this.body.x_align = St.Align.START;
         const bodyAction =
             (BODY_TOGGLES || !chevronAction ? toggleAction : chevronAction) ||
             chevronAction;
