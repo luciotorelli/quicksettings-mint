@@ -126,6 +126,28 @@ function contrastOn(css) {
 }
 
 /**
+ * Picks the panel battery icon for a charge level and state.
+ *
+ * Cinnamon ships these in 10% steps as xsi-battery-level-N[-charging], plus a
+ * -charged variant that only exists at 100. Names are returned without the
+ * -symbolic suffix, which set_applet_icon_symbolic_name() appends itself.
+ *
+ * @param {number} percent - 0-100.
+ * @param {string} status - The sysfs status string.
+ * @returns {string} Icon name.
+ */
+function batteryIconName(percent, status) {
+    const level = Math.max(0, Math.min(100, Math.round(percent / 10) * 10));
+    if (status === "Charging") {
+        return "xsi-battery-level-" + level + "-charging";
+    }
+    if (level === 100 && status !== "Discharging") {
+        return "xsi-battery-level-100-charged";
+    }
+    return "xsi-battery-level-" + level;
+}
+
+/**
  * "power-saver" -> "Power Saver".
  *
  * @param {string} text - Hyphenated or underscored identifier.
@@ -577,7 +599,7 @@ class QuickTile {
  *
  * @extends Applet.IconApplet
  */
-class QuickSettingsApplet extends Applet.IconApplet {
+class QuickSettingsApplet extends Applet.TextIconApplet {
     /**
      * Constructor for initializing the QuickSettingsApplet.
      *
@@ -589,7 +611,11 @@ class QuickSettingsApplet extends Applet.IconApplet {
     constructor(metadata, orientation, panel_height, instance_id) {
         super(orientation, panel_height, instance_id);
         this.detecting = false;
+        // Replaced by the battery readout as soon as one is found; this is
+        // only what shows if the machine has no battery at all.
         this.set_applet_icon_symbolic_name("preferences-system");
+        this.panelIconName = null;
+        this.set_show_label_in_vertical_panels(false);
         this.set_applet_tooltip(DEFAULT_TOOLTIP);
         this.actor.connect("scroll-event", (...args) => this._onScrollEvent(...args));
         this.lastTooltipTimeoutID = null;
@@ -621,6 +647,13 @@ class QuickSettingsApplet extends Applet.IconApplet {
 
         this._addMenuItems();
         this.updateStatus();
+
+        // The popup only refreshes when it opens; the panel readout has to
+        // keep up on its own.
+        this._batteryTimerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 30, () => {
+            this._refreshBattery();
+            return GLib.SOURCE_CONTINUE;
+        });
     }
 
     /**
@@ -2050,6 +2083,12 @@ class QuickSettingsApplet extends Applet.IconApplet {
             const name = this._findBattery();
             if (!name) {
                 this.batteryLabel.set_text("--%");
+                // Desktop with no battery: nothing useful to show in the panel.
+                this.set_applet_label("");
+                if (this.panelIconName !== "preferences-system") {
+                    this.panelIconName = "preferences-system";
+                    this.set_applet_icon_symbolic_name("preferences-system");
+                }
                 return;
             }
             const base = "/sys/class/power_supply/" + name + "/";
@@ -2061,13 +2100,25 @@ class QuickSettingsApplet extends Applet.IconApplet {
                 // warns about on every call.
                 return ok ? decoder.decode(contents).trim() : "";
             };
-            this.batteryLabel.set_text(read("capacity") + "%");
+            const capacity = read("capacity");
+            const status = read("status");
+
+            this.batteryLabel.set_text(capacity + "%");
             if (this.batteryIcon) {
                 this.batteryIcon.set_icon_name(
-                    read("status") === "Charging"
+                    status === "Charging"
                         ? "battery-good-charging-symbolic"
                         : "battery-good-symbolic"
                 );
+            }
+
+            // Panel readout: battery icon plus percentage, in place of the
+            // static settings cog.
+            this.set_applet_label(capacity + "%");
+            const iconName = batteryIconName(parseInt(capacity, 10) || 0, status);
+            if (iconName !== this.panelIconName) {
+                this.panelIconName = iconName;
+                this.set_applet_icon_symbolic_name(iconName);
             }
         } catch (e) {
             this.batteryLabel.set_text("--%");
@@ -2263,6 +2314,16 @@ class QuickSettingsApplet extends Applet.IconApplet {
     on_applet_clicked() {
         this.updateStatus();
         this.menu.toggle();
+    }
+
+    /**
+     * Drops the panel refresh timer when the applet goes away.
+     */
+    on_applet_removed_from_panel() {
+        if (this._batteryTimerId) {
+            GLib.source_remove(this._batteryTimerId);
+            this._batteryTimerId = 0;
+        }
     }
 
     /**
