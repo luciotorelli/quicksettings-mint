@@ -637,7 +637,7 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
         // Bound as key -> this.key_with_underscores, so the schema stays the
         // single place a setting is described.
         [
-            "show-wired", "show-bluetooth", "show-wifi", "show-power", "show-fan",
+            "show-wired", "show-bluetooth", "show-wifi", "show-vpn", "show-power", "show-fan",
             "show-nightlight", "show-awake", "show-airplane",
             "body-toggles",
             "pill-padding", "pill-radius", "pill-icon-size", "pill-spacing",
@@ -992,6 +992,13 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
                 expand: "wifi",
                 onToggle: (state) => this._setWifi(state),
             },
+            {
+                key: "vpn",
+                icon: "network-vpn-symbolic",
+                title: _("VPN"),
+                expand: "vpn",
+                onToggle: (state) => this._setVpn(state),
+            },
             // Multi-choice pills: no onToggle, so both halves open the panel.
             {
                 key: "power",
@@ -1112,7 +1119,7 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
         if (this.prefetch_panels === false) {
             return;
         }
-        ["wired", "wifi", "power", "fan", "audio", "bluetooth"].forEach((key, i) => {
+        ["wired", "wifi", "vpn", "power", "fan", "audio", "bluetooth"].forEach((key, i) => {
             GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, 50 * i, () => {
                 if (this.menu.isOpen) {
                     this._fetchPanel(key, (rows) => {
@@ -1394,6 +1401,7 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
         const fetchers = {
             wired: (c) => this._fetchWired(c),
             wifi: (c) => this._fetchWifi(c),
+            vpn: (c) => this._fetchVpn(c),
             bluetooth: (c) => this._fetchBluetooth(c),
             audio: (c) => this._fetchAudio(c),
             power: (c) => this._fetchPower(c),
@@ -1436,6 +1444,12 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
                 title: _("Sound"),
                 link: _("Sound Settings"),
                 command: "cinnamon-settings sound",
+            },
+            vpn: {
+                icon: "network-vpn-symbolic",
+                title: _("VPN"),
+                link: _("Network Settings"),
+                command: "cinnamon-settings network",
             },
             power: {
                 icon: "power-profile-balanced-symbolic",
@@ -1730,6 +1744,51 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
                 cb(rows);
             }
         );
+    }
+
+    /**
+     * Builds the VPN panel's rows from nmcli.
+     *
+     * Covers both `vpn` (OpenVPN, IPsec and friends) and `wireguard`, since
+     * NetworkManager files WireGuard tunnels under their own type rather than
+     * as VPNs - a filter on "vpn" alone finds nothing on a WireGuard setup.
+     *
+     * Connections are brought up by UUID rather than name: names are not
+     * unique and can contain anything, whereas a UUID is stable.
+     *
+     * @param {Function} cb - Receives row descriptors.
+     * @private
+     */
+    _fetchVpn(cb) {
+        // NAME last, so a name containing a colon cannot shift the fields.
+        this._runAll(["nmcli -t -f UUID,TYPE,ACTIVE,NAME con show"], ([out]) => {
+            const rows = [];
+            String(out).split("\n").forEach((line) => {
+                const m = line.match(/^([^:]*):([^:]*):([^:]*):(.*)$/);
+                if (!m || (m[2] !== "vpn" && m[2] !== "wireguard")) {
+                    return;
+                }
+                const uuid = m[1];
+                const up = m[3] === "yes";
+                const name = m[4].trim();
+                rows.push({
+                    kind: "row",
+                    icon: "network-vpn-symbolic",
+                    label: name || uuid,
+                    action: up ? _("Disconnect") : _("Connect"),
+                    run: () => {
+                        GLib.spawn_command_line_async(
+                            "nmcli con " + (up ? "down " : "up ") + GLib.shell_quote(uuid)
+                        );
+                        this._invalidatePanel("vpn");
+                    },
+                });
+            });
+            if (!rows.length) {
+                rows.push({ kind: "note", text: _("No VPN configured") });
+            }
+            cb(rows);
+        });
     }
 
     /**
@@ -2110,6 +2169,30 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
     }
 
     /**
+     * Brings the VPN up or down.
+     *
+     * Turning it off drops whatever is currently active; turning it on brings
+     * up the last active tunnel, or the first configured one if none has been
+     * up this session.
+     *
+     * @param {boolean} state - True to connect.
+     * @private
+     */
+    _setVpn(state) {
+        const uuid = state ? this.vpnDefaultUuid : this.vpnActiveUuid;
+        if (!uuid) {
+            return;
+        }
+        try {
+            GLib.spawn_command_line_async(
+                "nmcli con " + (state ? "up " : "down ") + GLib.shell_quote(uuid)
+            );
+        } catch (e) {
+            global.logError("Error toggling VPN in Quick Settings applet: " + e);
+        }
+    }
+
+    /**
      * Turns Wi-Fi on or off.
      *
      * Async on purpose: spawn_command_line_sync blocks the compositor for as
@@ -2361,6 +2444,43 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
                     );
                 }
             );
+        }
+
+        if (tile("vpn")) {
+            Util.spawnCommandLineAsyncIO("nmcli -t -f UUID,TYPE,ACTIVE,NAME con show", (out) => {
+                if (!tile("vpn")) {
+                    return;
+                }
+                let activeUuid = null;
+                let activeName = "";
+                let firstUuid = null;
+                let count = 0;
+                String(out).split("\n").forEach((line) => {
+                    const m = line.match(/^([^:]*):([^:]*):([^:]*):(.*)$/);
+                    if (!m || (m[2] !== "vpn" && m[2] !== "wireguard")) {
+                        return;
+                    }
+                    count += 1;
+                    if (!firstUuid) {
+                        firstUuid = m[1];
+                    }
+                    if (m[3] === "yes") {
+                        activeUuid = m[1];
+                        activeName = m[4].trim();
+                    }
+                });
+                this.vpnActiveUuid = activeUuid;
+                // Remember what to bring back up when the pill is switched on.
+                this.vpnDefaultUuid = activeUuid || this.vpnDefaultUuid || firstUuid;
+                tile("vpn").setActive(Boolean(activeUuid));
+                tile("vpn").setSubtitle(
+                    activeUuid
+                        ? activeName
+                        : count
+                        ? _("Not connected")
+                        : _("None configured")
+                );
+            });
         }
 
         if (tile("wifi")) {

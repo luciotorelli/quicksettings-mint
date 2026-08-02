@@ -1,29 +1,44 @@
 {
   "layout": {
     "type": "layout",
-    "pages": ["pillsPage", "appearancePage", "slidersPage", "behaviourPage"],
-
+    "pages": [
+      "pillsPage",
+      "appearancePage",
+      "slidersPage",
+      "behaviourPage"
+    ],
     "pillsPage": {
       "type": "page",
       "title": "Pills",
-      "sections": ["visibleSection", "interactionSection"]
+      "sections": [
+        "visibleSection",
+        "interactionSection"
+      ]
     },
     "appearancePage": {
       "type": "page",
       "title": "Appearance",
-      "sections": ["sizeSection", "colourSection"]
+      "sections": [
+        "sizeSection",
+        "colourSection"
+      ]
     },
     "slidersPage": {
       "type": "page",
       "title": "Sliders & Panel",
-      "sections": ["sliderSection", "panelSection"]
+      "sections": [
+        "sliderSection",
+        "panelSection"
+      ]
     },
     "behaviourPage": {
       "type": "page",
       "title": "Behaviour",
-      "sections": ["animationSection", "loadingSection"]
+      "sections": [
+        "animationSection",
+        "loadingSection"
+      ]
     },
-
     "visibleSection": {
       "type": "section",
       "title": "Which pills to show",
@@ -31,6 +46,7 @@
         "show-wired",
         "show-bluetooth",
         "show-wifi",
+        "show-vpn",
         "show-power",
         "show-fan",
         "show-nightlight",
@@ -41,43 +57,62 @@
     "interactionSection": {
       "type": "section",
       "title": "What clicking does",
-      "keys": ["body-toggles"]
+      "keys": [
+        "body-toggles"
+      ]
     },
-
     "sizeSection": {
       "type": "section",
       "title": "Size and shape",
-      "keys": ["pill-padding", "pill-radius", "pill-icon-size", "pill-spacing"]
+      "keys": [
+        "pill-padding",
+        "pill-radius",
+        "pill-icon-size",
+        "pill-spacing"
+      ]
     },
     "colourSection": {
       "type": "section",
       "title": "Colour",
-      "keys": ["use-theme-accent", "custom-accent", "text-contrast"]
+      "keys": [
+        "use-theme-accent",
+        "custom-accent",
+        "text-contrast"
+      ]
     },
-
     "sliderSection": {
       "type": "section",
       "title": "Sliders in the popup",
-      "keys": ["show-volume", "show-panel-brightness", "show-monitor-sliders"]
+      "keys": [
+        "show-volume",
+        "show-panel-brightness",
+        "show-monitor-sliders"
+      ]
     },
     "panelSection": {
       "type": "section",
       "title": "The button in the panel",
-      "keys": ["panel-show-battery-icon", "panel-show-percentage"]
+      "keys": [
+        "panel-show-battery-icon",
+        "panel-show-percentage"
+      ]
     },
-
     "animationSection": {
       "type": "section",
       "title": "Opening a panel",
-      "keys": ["animate-panels", "animation-duration"]
+      "keys": [
+        "animate-panels",
+        "animation-duration"
+      ]
     },
     "loadingSection": {
       "type": "section",
       "title": "Loading",
-      "keys": ["prefetch-panels"]
+      "keys": [
+        "prefetch-panels"
+      ]
     }
   },
-
   "show-wired": {
     "type": "switch",
     "default": true,
@@ -95,6 +130,12 @@
     "default": true,
     "description": "Wi-Fi",
     "tooltip": "Wi-Fi radio, with a panel listing nearby networks"
+  },
+  "show-vpn": {
+    "type": "switch",
+    "default": true,
+    "description": "VPN",
+    "tooltip": "VPN and WireGuard tunnels known to NetworkManager, with a panel to connect or disconnect each one"
   },
   "show-power": {
     "type": "switch",
@@ -126,14 +167,12 @@
     "description": "Airplane Mode",
     "tooltip": "Switches every radio off"
   },
-
   "body-toggles": {
     "type": "switch",
     "default": true,
     "description": "Clicking a pill toggles it, the arrow opens its panel",
     "tooltip": "This is how GNOME's Quick Settings behave. Turn it off to swap the two halves round, so clicking the pill opens its panel and the arrow does the toggling"
   },
-
   "pill-padding": {
     "type": "spinbutton",
     "default": 9,
@@ -174,7 +213,6 @@
     "description": "Gap between pills",
     "tooltip": "Applies both across a row and between rows"
   },
-
   "use-theme-accent": {
     "type": "switch",
     "default": true,
@@ -199,7 +237,6 @@
     },
     "tooltip": "Automatic picks dark or light from how bright the accent is, which keeps text readable on both a light orange and a dark blue"
   },
-
   "show-volume": {
     "type": "switch",
     "default": true,
@@ -218,7 +255,6 @@
     "description": "External monitor brightness and contrast",
     "tooltip": "Needs ddcutil installed and a monitor that speaks DDC/CI. Laptop panels do not"
   },
-
   "panel-show-battery-icon": {
     "type": "switch",
     "default": true,
@@ -231,7 +267,6 @@
     "description": "Show the battery percentage",
     "tooltip": "The number beside the icon in the panel"
   },
-
   "animate-panels": {
     "type": "switch",
     "default": true,
@@ -249,7 +284,6 @@
     "dependency": "animate-panels",
     "tooltip": "How long a panel takes to unfold. Around 150 to 250 feels responsive; higher starts to feel sluggish"
   },
-
   "prefetch-panels": {
     "type": "switch",
     "default": true,
