@@ -212,6 +212,11 @@ class Monitor {
         this.name = name;
         this.brightness = 50;
         this.contrast = 50;
+        // Not every monitor runs 0-100. The Dell S2716DG reports a contrast
+        // max of 125, so a hardcoded /100 mis-scales the slider and sends the
+        // wrong value back. Read the max ddcutil reports and scale by that.
+        this.brightnessMax = 100;
+        this.contrastMax = 100;
         this.bus = bus;
         this.menuLabel = null;
         this.menuSlider = null;
@@ -229,9 +234,14 @@ class Monitor {
             Util.spawnCommandLineAsyncIO(cmd, (stdout, stderr, exitCode) => {
                 setTimeout(resolve, 10);
                 if (exitCode === 0) {
-                    const matchRes = stdout.match(/current value =\s*(\d+)/);
+                    const matchRes = stdout.match(
+                        /current value =\s*(\d+)(?:,\s*max value =\s*(\d+))?/
+                    );
                     if (matchRes && matchRes[1]) {
                         this.brightness = parseInt(matchRes[1], 10);
+                        if (matchRes[2]) {
+                            this.brightnessMax = parseInt(matchRes[2], 10) || 100;
+                        }
                         this.updateMenu(); // Update UI with new brightness value
                     }
                 } else {
@@ -253,9 +263,14 @@ class Monitor {
             Util.spawnCommandLineAsyncIO(cmd, (stdout, stderr, exitCode) => {
                 setTimeout(resolve, 10);
                 if (exitCode === 0) {
-                    const matchRes = stdout.match(/current value =\s*(\d+)/);
+                    const matchRes = stdout.match(
+                        /current value =\s*(\d+)(?:,\s*max value =\s*(\d+))?/
+                    );
                     if (matchRes && matchRes[1]) {
                         this.contrast = parseInt(matchRes[1], 10);
+                        if (matchRes[2]) {
+                            this.contrastMax = parseInt(matchRes[2], 10) || 100;
+                        }
                         this.updateMenu(); // Update UI with new contrast value
                     }
                 } else {
@@ -282,10 +297,10 @@ class Monitor {
     updateMenu() {
         this.updateLabel();
         if (this.menuSlider) {
-            this.menuSlider.setValue(this.brightness / 100); // Set slider to current brightness value
+            this.menuSlider.setValue(this.brightness / this.brightnessMax);
         }
         if (this.contrastSlider) {
-            this.contrastSlider.setValue(this.contrast / 100); // Contrast tracked the same way
+            this.contrastSlider.setValue(this.contrast / this.contrastMax);
         }
     }
 
@@ -295,7 +310,7 @@ class Monitor {
      * @param {number} value - The new brightness value to set.
      */
     setBrightness(value) {
-        this.brightness = Math.round(value);
+        this.brightness = Math.max(0, Math.min(this.brightnessMax, Math.round(value)));
         this.updateMenu(); // Reflect the change in the UI
         this.promises = this.promises.then(() => {
             return new Promise((resolve, reject) => {
@@ -314,7 +329,7 @@ class Monitor {
      * @param {number} value - The new contrast value to set.
      */
     setContrast(value) {
-        this.contrast = Math.round(value);
+        this.contrast = Math.max(0, Math.min(this.contrastMax, Math.round(value)));
         this.updateMenu(); // Reflect the change in the UI
         this.promises = this.promises.then(() => {
             return new Promise((resolve, reject) => {
@@ -653,6 +668,24 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
         this.menu = new Applet.AppletPopupMenu(this, orientation);
         this.menuManager.addMenu(this.menu);
 
+        // Swapping a monitor leaves the old scan in place - the applet only
+        // looked for displays at startup, so the sliders simply vanished and
+        // stayed gone. Rescan when the display layout changes, debounced
+        // because the signal fires several times through a swap and DDC/CI
+        // needs the panel to finish waking before it will answer.
+        this._monitorsChangedId = Main.layoutManager.connect("monitors-changed", () => {
+            if (this._monitorRescanId) {
+                GLib.source_remove(this._monitorRescanId);
+            }
+            this._monitorRescanId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 3, () => {
+                this._monitorRescanId = 0;
+                if (!this.detecting) {
+                    this.updateMonitors(false).catch(() => {});
+                }
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+
         this.menu.connect("open-state-changed", (menu, open) => {
             if (open) {
                 this._prefetchPanels();
@@ -924,29 +957,78 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
                 })
             );
             const slider = this._makeSlider("5em");
-            slider.connect("drag-end", (s) => onCommit(Math.round(100 * s.value)));
+            slider.connect("drag-end", (s) => onCommit(s.value));
             row.add_child(slider.actor);
             return slider;
         };
 
-        monitor.menuSlider = pair("video-display-symbolic", (v) => monitor.setBrightness(v));
-        monitor.contrastSlider = pair("preferences-color-symbolic", (v) => monitor.setContrast(v));
-
-        row.add_child(
-            this._iconButton("emblem-synchronizing-symbolic", 16, () => {
-                if (this.detecting) {
-                    return;
-                }
-                const infoOSD = new ModalDialog.InfoOSD("Detecting displays...");
-                infoOSD.show();
-                this.updateMonitors(false).then(
-                    () => this.menu.open(true),
-                    (e) => global.logError("Error: " + e)
-                ).then(() => infoOSD.destroy());
-            })
+        // The slider hands back a fraction; each control is scaled by its own
+        // maximum rather than assuming 100.
+        monitor.menuSlider = pair("video-display-symbolic", (f) =>
+            monitor.setBrightness(f * monitor.brightnessMax)
+        );
+        monitor.contrastSlider = pair("preferences-color-symbolic", (f) =>
+            monitor.setContrast(f * monitor.contrastMax)
         );
 
+        row.add_child(this._detectButton());
+
         monitor.updateMenu(); // push the values already read onto the sliders
+        return row;
+    }
+
+    /**
+     * The re-detect button.
+     *
+     * Shared, because it also has to appear when nothing was detected. It used
+     * to live only inside a monitor row, which meant that if the scan came back
+     * empty - after a monitor swap, say - the row was never built and there was
+     * no way left in the UI to scan again.
+     *
+     * @returns {object} The button actor.
+     * @private
+     */
+    _detectButton() {
+        return this._iconButton("emblem-synchronizing-symbolic", 16, () => {
+            if (this.detecting) {
+                return;
+            }
+            const infoOSD = new ModalDialog.InfoOSD("Detecting displays...");
+            infoOSD.show();
+            this.updateMonitors(false).then(
+                () => this.menu.open(true),
+                (e) => global.logError("Error: " + e)
+            ).then(() => infoOSD.destroy());
+        });
+    }
+
+    /**
+     * Stand-in row shown when no DDC/CI display was found, so the scan can
+     * always be retried.
+     *
+     * @returns {object} The row actor.
+     * @private
+     */
+    _noMonitorRow() {
+        const row = new St.BoxLayout({ vertical: false, style: "spacing: 8px; padding: 2px 6px;" });
+        row.set_x_expand(true);
+        row.add_child(
+            new St.Icon({
+                icon_name: "video-display-symbolic",
+                icon_type: St.IconType.SYMBOLIC,
+                icon_size: 18,
+            })
+        );
+        const label = new St.Label({
+            text: _("No DDC/CI display"),
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        label.set_style("color: rgba(255,255,255,0.45);");
+        row.add_child(label);
+        const spacer = new St.Widget();
+        spacer.set_x_expand(true);
+        row.add_child(spacer);
+        row.add_child(this._detectButton());
         return row;
     }
 
@@ -1999,7 +2081,11 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
         }
 
         if (this.show_monitor_sliders !== false) {
-            this.monitors.forEach((monitor) => box.add_child(this._monitorRow(monitor)));
+            if (this.monitors.length) {
+                this.monitors.forEach((monitor) => box.add_child(this._monitorRow(monitor)));
+            } else {
+                box.add_child(this._noMonitorRow());
+            }
         }
 
         return box;
@@ -2579,6 +2665,14 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
             GLib.source_remove(this._batteryTimerId);
             this._batteryTimerId = 0;
         }
+        if (this._monitorRescanId) {
+            GLib.source_remove(this._monitorRescanId);
+            this._monitorRescanId = 0;
+        }
+        if (this._monitorsChangedId) {
+            Main.layoutManager.disconnect(this._monitorsChangedId);
+            this._monitorsChangedId = 0;
+        }
     }
 
     /**
@@ -2604,11 +2698,14 @@ class QuickSettingsApplet extends Applet.TextIconApplet {
         }
 
         clearTimeout(this.lastTooltipTimeoutID);
-        let adjustment = (direction == Clutter.ScrollDirection.UP) ? BRIGHTNESS_ADJUSTMENT_STEP : -BRIGHTNESS_ADJUSTMENT_STEP;
+        let percentStep = (direction == Clutter.ScrollDirection.UP) ? BRIGHTNESS_ADJUSTMENT_STEP : -BRIGHTNESS_ADJUSTMENT_STEP;
         let tooltipMessage = this.monitors.map(monitor => {
-            monitor.brightness = Math.min(100, Math.max(0, monitor.brightness + adjustment));
-            monitor.setBrightness(monitor.brightness);
-            return `${monitor.name}: ${monitor.brightness}%`;
+            // Step and readout are in percent; the device value is scaled to
+            // whatever range that monitor actually reports.
+            const step = Math.round((percentStep * monitor.brightnessMax) / 100) || percentStep;
+            monitor.setBrightness(monitor.brightness + step);
+            const percent = Math.round((monitor.brightness / monitor.brightnessMax) * 100);
+            return `${monitor.name}: ${percent}%`;
         }).join("\n");
 
         this.set_applet_tooltip(tooltipMessage);
